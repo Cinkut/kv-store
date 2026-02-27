@@ -1,6 +1,7 @@
 add_executable(kvstore_tests
     storage_test.cpp
     protocol_test.cpp
+    integration_test.cpp
 )
 target_link_libraries(kvstore_tests
     PRIVATE

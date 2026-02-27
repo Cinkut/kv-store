@@ -99,36 +99,42 @@ Goal: A working single-node KV server that accepts TCP connections and responds 
   - `NodeState` enum (`Follower`/`Candidate`/`Leader`) defined in `logger.hpp`
   - All other modules link `kv_common` (not `spdlog::spdlog` directly)
 
-- [ ] **1.3 Storage engine**
+- [x] **1.3 Storage engine**
   - Class `kv::Storage`
   - Internal: `std::unordered_map<std::string, std::string>` + `std::shared_mutex`
   - Methods: `get(key)`, `set(key, value)`, `del(key)`, `keys()`, `size()`, `snapshot()` (returns full copy)
   - `get` returns `std::optional<std::string>`
   - Unit tests: basic CRUD, concurrent reads/writes (multiple threads)
+  - Verified: 26/26 tests pass
 
-- [ ] **1.4 Text protocol**
+- [x] **1.4 Text protocol**
   - Class `kv::Protocol`
   - Parse: `std::string_view` → `kv::Command` (variant: SetCmd, GetCmd, DelCmd, KeysCmd, PingCmd)
   - Serialize: `kv::Response` → `std::string`
   - Commands: `SET key value\n`, `GET key\n`, `DEL key\n`, `KEYS\n`, `PING\n`
   - Responses: `OK\n`, `VALUE <v>\n`, `NOT_FOUND\n`, `DELETED\n`, `KEYS <k1> <k2>...\n`, `PONG\n`, `ERROR <msg>\n`
   - Unit tests: valid commands, malformed input, edge cases (empty key, spaces in value)
+  - Verified: 31/31 tests pass
 
-- [ ] **1.5 TCP server**
+- [x] **1.5 TCP server**
   - Class `kv::Server` – owns `io_context`, `tcp::acceptor`
   - `co_spawn` per accepted connection → `kv::Session`
   - `kv::Session::run()` – `boost::asio::awaitable<void>`, reads lines, parses, executes on Storage, writes response
   - Graceful shutdown on SIGINT/SIGTERM (`boost::asio::signal_set`)
   - Thread pool: `std::thread::hardware_concurrency()` threads running `io_context`
+  - All targets build cleanly; 57/57 tests pass
 
-- [ ] **1.6 kv-cli**
+- [x] **1.6 kv-cli**
   - CLI args: `--host`, `--port` (defaults: 127.0.0.1:6379)
   - REPL loop: read stdin → send to server → print response
   - Handle disconnect gracefully
+  - Verified: builds successfully; async TCP I/O with sync stdin using `as_tuple(use_awaitable)` pattern
 
-- [ ] **1.7 Integration test**
+- [x] **1.7 Integration test**
   - Start server in test, connect via TCP, run SET/GET/DEL/KEYS/PING sequence
   - Verify correct responses
+  - Tests: Ping, SetAndGet, GetNotFound, Overwrite, Del, DelNotFound, KeysEmpty, KeysAfterInserts, ValueWithSpaces, MultipleConnections, MalformedCommand, SetEmptyValueRejected, PipelineMultipleCommands
+  - Verified: 70/70 tests pass (26 storage + 31 protocol + 13 integration)
 
 ### Etap 2 – Cluster Communication
 

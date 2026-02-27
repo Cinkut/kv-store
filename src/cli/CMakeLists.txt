@@ -4,5 +4,6 @@ target_link_libraries(kv-cli
         kv_common
         Boost::asio
         Boost::system
+        Boost::program_options
         kv_compile_options
 )
