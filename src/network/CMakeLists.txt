@@ -8,7 +8,7 @@ target_link_libraries(kv_network
     PUBLIC
         Boost::asio
         Boost::system
-        spdlog::spdlog
+        kv_common
         kv_storage
     PRIVATE
         kv_compile_options

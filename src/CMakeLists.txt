@@ -1,4 +1,5 @@
 # ── Per-module libraries ──────────────────────────────────────────────────────
+add_subdirectory(common)
 add_subdirectory(storage)
 add_subdirectory(network)
 add_subdirectory(raft)
@@ -10,6 +11,7 @@ add_subdirectory(cli)
 add_library(kvstore_lib INTERFACE)
 target_link_libraries(kvstore_lib
     INTERFACE
+        kv_common
         kv_storage
         kv_network
         kv_raft

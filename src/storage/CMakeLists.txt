@@ -3,6 +3,6 @@ add_library(kv_storage STATIC
 )
 target_include_directories(kv_storage PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(kv_storage
-    PUBLIC  spdlog::spdlog
+    PUBLIC  kv_common
     PRIVATE kv_compile_options
 )

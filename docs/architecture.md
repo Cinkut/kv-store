@@ -90,11 +90,14 @@ Goal: A working single-node KV server that accepts TCP connections and responds 
   - `.gitignore`
   - Verified: all 3 binaries build, 2/2 placeholder tests pass
 
-- [ ] **1.2 spdlog integration**
-  - Global logger initialization with pattern: `[%Y-%m-%d %H:%M:%S.%e] [%n] [%^%l%$] %v`
-  - Per-node logger (name = `node-<id>`)
-  - Log levels configurable via `--log-level` CLI arg
-  - Color coding: Leader=green, Candidate=yellow, Follower=default
+- [x] **1.2 spdlog integration**
+  - `src/common/logger.hpp` + `logger.cpp` → `kv_common` static library
+  - `init_default_logger(level)` – global default logger (CLI, tests, early startup)
+  - `make_node_logger(node_id, level)` – per-node logger, name = `node-<id>`
+  - `parse_log_level(string)` – parses CLI string to `spdlog::level::level_enum`
+  - Pattern: `[%Y-%m-%d %H:%M:%S.%f] [%n] [%^%l%$] %v` (color per level)
+  - `NodeState` enum (`Follower`/`Candidate`/`Leader`) defined in `logger.hpp`
+  - All other modules link `kv_common` (not `spdlog::spdlog` directly)
 
 - [ ] **1.3 Storage engine**
   - Class `kv::Storage`
