@@ -1,0 +1,36 @@
+# Build
+build/
+cmake-build-*/
+out/
+
+# vcpkg
+vcpkg_installed/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Compiled
+*.o
+*.a
+*.so
+*.dylib
+
+# Generated (protobuf, etc.)
+generated/
+
+# Data directories (WAL, snapshots)
+data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
