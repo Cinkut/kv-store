@@ -1,0 +1,13 @@
+add_executable(kvstore_tests
+    storage_test.cpp
+    protocol_test.cpp
+)
+target_link_libraries(kvstore_tests
+    PRIVATE
+        kvstore_lib
+        GTest::gtest
+        GTest::gtest_main
+        kv_compile_options
+)
+include(GoogleTest)
+gtest_discover_tests(kvstore_tests)

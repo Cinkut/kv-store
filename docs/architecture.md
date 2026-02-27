@@ -83,12 +83,12 @@ kv_store/
 
 Goal: A working single-node KV server that accepts TCP connections and responds to text commands.
 
-- [ ] **1.1 Project scaffolding**
-  - CMakeLists.txt (root + per-module)
-  - CMakePresets.json (Debug with `-g -O0 -fsanitize=address`, Release with `-O2`)
-  - vcpkg.json manifest
+- [x] **1.1 Project scaffolding**
+  - CMakeLists.txt (root + per-module), FetchContent for Boost/spdlog/gtest/protobuf
+  - CMakePresets.json (Debug / Release / debug-asan), Unix Makefiles generator
+  - vcpkg.json manifest (declarative, FetchContent is the actual mechanism)
   - `.gitignore`
-  - Verify build compiles an empty `main.cpp`
+  - Verified: all 3 binaries build, 2/2 placeholder tests pass
 
 - [ ] **1.2 spdlog integration**
   - Global logger initialization with pattern: `[%Y-%m-%d %H:%M:%S.%e] [%n] [%^%l%$] %v`
