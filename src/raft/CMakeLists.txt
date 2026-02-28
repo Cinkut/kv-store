@@ -5,6 +5,7 @@ add_library(kv_raft STATIC
     state_machine.cpp
     real_timer.cpp
     raft_transport.cpp
+    commit_awaiter.cpp
 )
 
 # ── Protobuf code generation ──────────────────────────────────────────────────

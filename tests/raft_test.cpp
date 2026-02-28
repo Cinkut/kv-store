@@ -1,3 +1,4 @@
+#include "raft/commit_awaiter.hpp"
 #include "raft/raft_log.hpp"
 #include "raft/raft_node.hpp"
 #include "raft/state_machine.hpp"
@@ -2257,4 +2258,142 @@ TEST_F(RaftNodeTest, PersistCallbackOnAppendEntries) {
 
     node.stop();
     pump(ioc_);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CommitAwaiter tests
+// ════════════════════════════════════════════════════════════════════════════
+
+class CommitAwaiterTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        spdlog::drop("kv");
+        kv::init_default_logger();
+        logger_ = spdlog::get("kv");
+    }
+
+    boost::asio::io_context ioc_;
+    std::shared_ptr<spdlog::logger> logger_;
+};
+
+TEST_F(CommitAwaiterTest, NotifyBeforeTimeout) {
+    kv::raft::CommitAwaiter awaiter(ioc_, logger_);
+    bool result = false;
+
+    boost::asio::co_spawn(ioc_, [&]() -> boost::asio::awaitable<void> {
+        result = co_await awaiter.wait_for_commit(1);
+    }, boost::asio::detached);
+
+    pump(ioc_);
+    EXPECT_EQ(awaiter.pending_count(), 1u);
+
+    // Notify commit — should wake the waiter with success.
+    awaiter.notify_commit(1);
+    pump(ioc_);
+
+    EXPECT_TRUE(result);
+    EXPECT_EQ(awaiter.pending_count(), 0u);
+}
+
+TEST_F(CommitAwaiterTest, Timeout) {
+    kv::raft::CommitAwaiter awaiter(ioc_, logger_);
+    bool result = true; // Start true to prove it flips.
+
+    boost::asio::co_spawn(ioc_, [&]() -> boost::asio::awaitable<void> {
+        result = co_await awaiter.wait_for_commit(
+            1, std::chrono::milliseconds{1});
+    }, boost::asio::detached);
+
+    pump(ioc_);
+    // Timer is very short, let it expire.
+    std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    pump(ioc_, 200);
+
+    EXPECT_FALSE(result);
+    EXPECT_EQ(awaiter.pending_count(), 0u);
+}
+
+TEST_F(CommitAwaiterTest, FailAll) {
+    kv::raft::CommitAwaiter awaiter(ioc_, logger_);
+    bool result1 = true, result2 = true;
+
+    boost::asio::co_spawn(ioc_, [&]() -> boost::asio::awaitable<void> {
+        result1 = co_await awaiter.wait_for_commit(1);
+    }, boost::asio::detached);
+    boost::asio::co_spawn(ioc_, [&]() -> boost::asio::awaitable<void> {
+        result2 = co_await awaiter.wait_for_commit(2);
+    }, boost::asio::detached);
+
+    pump(ioc_);
+    EXPECT_EQ(awaiter.pending_count(), 2u);
+
+    awaiter.fail_all();
+    pump(ioc_);
+
+    EXPECT_FALSE(result1);
+    EXPECT_FALSE(result2);
+    EXPECT_EQ(awaiter.pending_count(), 0u);
+}
+
+TEST_F(CommitAwaiterTest, NotifyUnknownIndexIsNoop) {
+    kv::raft::CommitAwaiter awaiter(ioc_, logger_);
+
+    // Notifying an index with no waiter should not crash.
+    awaiter.notify_commit(42);
+    EXPECT_EQ(awaiter.pending_count(), 0u);
+}
+
+TEST_F(CommitAwaiterTest, MultipleIndicesIndependent) {
+    kv::raft::CommitAwaiter awaiter(ioc_, logger_);
+    bool result1 = false, result2 = true;
+
+    boost::asio::co_spawn(ioc_, [&]() -> boost::asio::awaitable<void> {
+        result1 = co_await awaiter.wait_for_commit(10);
+    }, boost::asio::detached);
+    boost::asio::co_spawn(ioc_, [&]() -> boost::asio::awaitable<void> {
+        result2 = co_await awaiter.wait_for_commit(20);
+    }, boost::asio::detached);
+
+    pump(ioc_);
+    EXPECT_EQ(awaiter.pending_count(), 2u);
+
+    // Commit only index 10 — index 20 stays pending.
+    awaiter.notify_commit(10);
+    pump(ioc_);
+
+    EXPECT_TRUE(result1);
+    EXPECT_EQ(awaiter.pending_count(), 1u);
+
+    // Now fail the remaining.
+    awaiter.fail_all();
+    pump(ioc_);
+
+    EXPECT_FALSE(result2);
+    EXPECT_EQ(awaiter.pending_count(), 0u);
+}
+
+TEST_F(CommitAwaiterTest, DuplicateWaitSameIndex) {
+    kv::raft::CommitAwaiter awaiter(ioc_, logger_);
+    bool result1 = false, result2 = true;
+
+    boost::asio::co_spawn(ioc_, [&]() -> boost::asio::awaitable<void> {
+        result1 = co_await awaiter.wait_for_commit(5);
+    }, boost::asio::detached);
+
+    pump(ioc_);
+    EXPECT_EQ(awaiter.pending_count(), 1u);
+
+    // Second wait on same index should fail immediately (returns false).
+    boost::asio::co_spawn(ioc_, [&]() -> boost::asio::awaitable<void> {
+        result2 = co_await awaiter.wait_for_commit(5);
+    }, boost::asio::detached);
+
+    pump(ioc_);
+    EXPECT_FALSE(result2);
+
+    // Original waiter still works.
+    awaiter.notify_commit(5);
+    pump(ioc_);
+    EXPECT_TRUE(result1);
+    EXPECT_EQ(awaiter.pending_count(), 0u);
 }
