@@ -140,19 +140,19 @@ Goal: A working single-node KV server that accepts TCP connections and responds 
 
 Goal: 3 node processes that know about each other and can exchange messages.
 
-- [ ] **2.1 Node configuration**
+- [x] **2.1 Node configuration**
   - `kv::NodeConfig` struct: `id`, `host`, `client_port`, `raft_port`, `data_dir`, `peers[]`, `snapshot_interval`
   - `boost::program_options` parsing (see `docs/raft-spec.md` for full CLI args)
   - Validate: id > 0, ports in range, at least 2 peers
 
-- [ ] **2.2 Peer client**
+- [x] **2.2 Peer client**
   - Class `kv::network::PeerClient`
   - Async TCP client with `co_await`
   - Auto-reconnect with exponential backoff (100ms → 200ms → 400ms → ... → 5s cap)
   - Send/receive length-prefixed protobuf messages
   - Connection states: `Disconnected` → `Connecting` → `Connected`
 
-- [ ] **2.3 Peer discovery**
+- [x] **2.3 Peer discovery**
   - On startup: attempt connection to all peers from config
   - Log connection state changes
   - Periodic connectivity check (heartbeat before Raft is active)
@@ -162,23 +162,23 @@ Goal: 3 node processes that know about each other and can exchange messages.
 
 Goal: Leader election + log replication. The hard part.
 
-- [ ] **3.1 Protobuf schema**
+- [x] **3.1 Protobuf schema**
   - Define `proto/raft.proto` (see `docs/raft-spec.md` for full schema)
   - CMake: `protobuf_generate_cpp()` → generated code in build dir
 
-- [ ] **3.2 Raft data structures**
+- [x] **3.2 Raft data structures**
   - `kv::raft::LogEntry` – wraps protobuf LogEntry
   - `kv::raft::RaftLog` – in-memory `std::vector<LogEntry>`, index/term accessors
   - `kv::raft::RaftNode` skeleton – enum `NodeState { Follower, Candidate, Leader }`
 
-- [ ] **3.3 Leader election**
+- [x] **3.3 Leader election**
   - Election timer: `boost::asio::steady_timer`, random [150ms, 300ms]
   - Follower → Candidate on timeout: increment term, vote for self, send RequestVote to all peers
   - Vote logic: grant if candidate's log is at least as up-to-date, haven't voted for anyone else this term
   - Step-down: any RPC with higher term → revert to Follower
   - Tests: mock transport, deterministic timers. Scenarios: normal election, split vote, stale candidate
 
-- [ ] **3.4 Log replication**
+- [x] **3.4 Log replication**
   - Leader receives client command → append to local log → send AppendEntries to all peers
   - AppendEntries consistency check: prevLogIndex + prevLogTerm must match
   - Follower: append entries, update commitIndex to min(leaderCommit, last new entry index)
@@ -186,12 +186,12 @@ Goal: Leader election + log replication. The hard part.
   - Commit rule: majority of matchIndex >= N AND log[N].term == currentTerm → commit
   - Tests: basic replication, follower catch-up, leader failover
 
-- [ ] **3.5 State machine**
+- [x] **3.5 State machine**
   - `kv::raft::StateMachine` wraps `kv::Storage`
   - Applies committed log entries to storage: SET → storage.set(), DEL → storage.del()
   - Tracks `lastApplied` index
 
-- [ ] **3.6 Client redirect**
+- [x] **3.6 Client redirect**
   - Follower receiving write command → `REDIRECT <leader_host>:<leader_port>\n`
   - Leader ID tracked in RaftNode (received via AppendEntries)
 
