@@ -5,6 +5,8 @@ add_executable(kvstore_tests
     node_config_test.cpp
     peer_client_test.cpp
     peer_manager_test.cpp
+    raft_test.cpp
+    redirect_test.cpp
 )
 target_link_libraries(kvstore_tests
     PRIVATE

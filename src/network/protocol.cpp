@@ -126,6 +126,8 @@ std::string serialize_response(const Response& response) {
                 return out;
             } else if constexpr (std::is_same_v<T, ErrorResp>) {
                 return "ERROR " + r.message + "\n";
+            } else if constexpr (std::is_same_v<T, RedirectResp>) {
+                return "REDIRECT " + r.address + "\n";
             }
         },
         response);

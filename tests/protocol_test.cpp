@@ -197,6 +197,23 @@ TEST(SerializeResponse, ErrorAlwaysEndsWithNewline) {
     EXPECT_EQ(r.back(), '\n');
 }
 
+// ── serialize_response: REDIRECT ─────────────────────────────────────────────
+
+TEST(SerializeResponse, Redirect) {
+    EXPECT_EQ(serialize_response(RedirectResp{"127.0.0.1:6001"}),
+              "REDIRECT 127.0.0.1:6001\n");
+}
+
+TEST(SerializeResponse, RedirectAlwaysEndsWithNewline) {
+    auto r = serialize_response(RedirectResp{"10.0.0.1:8080"});
+    EXPECT_EQ(r.back(), '\n');
+}
+
+TEST(SerializeResponse, RedirectWithHostname) {
+    EXPECT_EQ(serialize_response(RedirectResp{"node1.example.com:7001"}),
+              "REDIRECT node1.example.com:7001\n");
+}
+
 // ── Round-trip: parse then serialize ─────────────────────────────────────────
 
 TEST(RoundTrip, PingProducesPong) {

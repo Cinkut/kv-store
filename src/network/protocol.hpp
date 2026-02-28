@@ -51,8 +51,13 @@ struct ErrorResp {
     std::string message;
 };
 
+struct RedirectResp {
+    std::string address; // "host:port" of the current leader
+};
+
 using Response =
-    std::variant<OkResp, PongResp, NotFoundResp, DeletedResp, ValueResp, KeysResp, ErrorResp>;
+    std::variant<OkResp, PongResp, NotFoundResp, DeletedResp, ValueResp, KeysResp, ErrorResp,
+                 RedirectResp>;
 
 // ── Protocol ──────────────────────────────────────────────────────────────────
 

@@ -60,6 +60,9 @@ set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(abseil protobuf Boost spdlog googletest)
 
+# ── Protobuf code-generation helper (provided by protobuf but not auto-included)
+include(${protobuf_SOURCE_DIR}/cmake/protobuf-generate.cmake)
+
 # ── Sanitizers (optional, requires libasan/libubsan) ─────────────────────────
 option(KV_ENABLE_SANITIZERS "Enable ASan + UBSan (requires libasan)" OFF)
 

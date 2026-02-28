@@ -21,6 +21,10 @@ constexpr auto use_awaitable = boost::asio::as_tuple(boost::asio::use_awaitable)
 Session::Session(boost::asio::ip::tcp::socket socket, Storage& storage)
     : socket_(std::move(socket)), storage_(storage) {}
 
+Session::Session(boost::asio::ip::tcp::socket socket, Storage& storage,
+                 ClusterContext& cluster_ctx)
+    : socket_(std::move(socket)), storage_(storage), cluster_ctx_(&cluster_ctx) {}
+
 boost::asio::awaitable<void> Session::run() {
     const auto remote = [&]() -> std::string {
         boost::system::error_code ec;
@@ -99,10 +103,26 @@ Response Session::dispatch(const Command& cmd) {
                 return ValueResp{std::move(*val)};
 
             } else if constexpr (std::is_same_v<T, SetCmd>) {
+                // In cluster mode, only the leader processes writes.
+                if (cluster_ctx_ && !cluster_ctx_->is_leader()) {
+                    auto addr = cluster_ctx_->leader_address();
+                    if (addr) {
+                        return RedirectResp{std::move(*addr)};
+                    }
+                    return ErrorResp{"no leader available"};
+                }
                 storage_.set(c.key, c.value);
                 return OkResp{};
 
             } else if constexpr (std::is_same_v<T, DelCmd>) {
+                // In cluster mode, only the leader processes writes.
+                if (cluster_ctx_ && !cluster_ctx_->is_leader()) {
+                    auto addr = cluster_ctx_->leader_address();
+                    if (addr) {
+                        return RedirectResp{std::move(*addr)};
+                    }
+                    return ErrorResp{"no leader available"};
+                }
                 const bool removed = storage_.del(c.key);
                 if (!removed) {
                     return NotFoundResp{};
