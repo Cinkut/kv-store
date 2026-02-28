@@ -199,7 +199,7 @@ Goal: Leader election + log replication. The hard part.
 
 Goal: Data survives node restarts.
 
-- [ ] **4.1 Write-Ahead Log**
+- [x] **4.1 Write-Ahead Log**
   - Class `kv::persistence::WAL`
   - Append-only binary file (see `docs/raft-spec.md` for format)
   - `append(LogEntry)` → write + fsync
@@ -207,32 +207,74 @@ Goal: Data survives node restarts.
   - CRC32 validation on read
   - Persist `currentTerm` + `votedFor` as special WAL entries
   - Tests: write/read/replay, corruption detection (bad CRC)
+  - Verified: 32 new tests, 195/195 total pass
 
-- [ ] **4.2 Snapshots**
+- [x] **4.2 Snapshots**
   - Class `kv::persistence::Snapshot`
   - Serialize full `Storage` state to file (format in `docs/raft-spec.md`)
   - Trigger: every N committed entries (configurable)
   - After snapshot: truncate WAL entries ≤ snapshot's last_included_index
   - Startup sequence: load snapshot → replay WAL from snapshot point → ready
   - Tests: snapshot + restore, snapshot + WAL replay
+  - Verified: 28 new tests, 223/223 total pass
 
-- [ ] **4.3 InstallSnapshot RPC**
+- [x] **4.3 InstallSnapshot RPC**
   - Leader sends snapshot to followers that are too far behind (nextIndex < first log index)
   - Follower: receive snapshot, write to disk, reset state machine, reply
+  - `SnapshotIO` abstract interface in `raft_node.hpp` (decouples from file I/O)
+  - `RaftLog::truncate_prefix()` for log compaction after snapshot
+  - `StateMachine::reset()` for snapshot installation
+  - Auto-trigger via `maybe_trigger_snapshot()` after applying committed entries
+  - Verified: 23 new tests, 246/246 total pass
 
 ### Etap 5 – Optimization
 
-Goal: Performance improvements.
+Goal: Performance improvements via binary client protocol.
 
 - [ ] **5.1 Binary client protocol**
-  - Header: `[msg_type: 1B][payload_length: 4B]`
-  - Auto-detect: first byte of connection determines text vs binary mode
-  - Benchmark: compare throughput text vs binary
 
-- [ ] **5.2 io_uring (optional)**
-  - Replace fsync in WAL with io_uring submission
-  - Potentially: io_uring for network accept/read/write
-  - Benchmark: compare latency/throughput vs Boost.Asio
+  Wire format defined in `docs/raft-spec.md` section 9. All integers big-endian.
+
+  - [ ] **5.1.1 Binary protocol parser/serializer**
+    - New files: `src/network/binary_protocol.hpp`, `src/network/binary_protocol.cpp`
+    - `parse_binary_request(span<const uint8_t>)` → `variant<Command, ErrorResp>`
+    - `serialize_binary_response(const Response&)` → `vector<uint8_t>`
+    - Reuse existing `Command` / `Response` variant types — no new domain types
+    - Request: `[msg_type: u8][payload_length: u32 BE][payload]`
+    - Response: `[status: u8][payload_length: u32 BE][payload]`
+    - msg_type: `0x01`=SET, `0x02`=GET, `0x03`=DEL, `0x04`=KEYS, `0x05`=PING
+    - status: `0x00`=OK, `0x01`=VALUE, `0x02`=NOT_FOUND, `0x03`=DELETED, `0x04`=KEYS, `0x05`=PONG, `0x10`=ERROR, `0x20`=REDIRECT
+
+  - [ ] **5.1.2 Unit tests for binary protocol**
+    - New file: `tests/binary_protocol_test.cpp`
+    - Test all 5 request types: encode → decode round-trip
+    - Test all 8 response statuses: serialize → verify bytes
+    - Test malformed inputs: truncated header, unknown msg_type, payload too short, zero-length key
+    - ~20-25 tests
+
+  - [ ] **5.1.3 Dual-mode session (auto-detect text vs binary)**
+    - Modify `Session::run()`: peek first byte of connection
+    - First byte `0x00–0x1F` → binary mode, `0x20–0x7F` → text mode
+    - Split into `run_text()` (existing logic) and `run_binary()` (new)
+    - Binary loop: read 5-byte header → read payload → parse → dispatch → serialize → write
+    - `dispatch()` unchanged — works on protocol-agnostic `Command`/`Response`
+
+  - [ ] **5.1.4 Integration tests for binary protocol**
+    - New `BinarySyncClient` test helper in `tests/integration_test.cpp`
+    - Test all operations via binary wire: PING, SET+GET, DEL, KEYS, errors
+    - Test auto-detection: text and binary clients on the same server simultaneously
+
+  - [ ] **5.1.5 kv-cli `--binary` flag**
+    - Add `--binary` option to `src/cli/main.cpp`
+    - When set: encode commands as binary requests, decode binary responses
+    - Validates full end-to-end binary path
+
+  - [ ] **5.1.6 Throughput benchmark**
+    - Standalone benchmark: N SET+GET cycles, measure elapsed time
+    - Compare text vs binary protocol throughput
+    - Print results summary (ops/sec, latency percentiles)
+
+- [x] **5.2 io_uring** — Skipped (optional, minimal benefit for this project scope)
 
 ---
 
@@ -242,9 +284,10 @@ Goal: Performance improvements.
 |-----------------------------|--------------------|----------------------------------------------------|
 | `storage_test.cpp`          | Unit               | CRUD, concurrent access, edge cases                |
 | `protocol_test.cpp`         | Unit               | Parse/serialize all commands, malformed input       |
-| `raft_election_test.cpp`    | Unit (mock)        | Election scenarios: normal, split vote, stale       |
-| `raft_replication_test.cpp` | Unit (mock)        | Replication, catch-up, commit, leader change        |
+| `binary_protocol_test.cpp`  | Unit               | Binary encode/decode, round-trips, malformed input  |
+| `raft_test.cpp`             | Unit (mock)        | Election, replication, InstallSnapshot, snapshots   |
 | `wal_test.cpp`              | Unit               | Write, replay, CRC corruption                      |
-| `integration_test.cpp`      | Integration        | 3-node cluster, SET on leader, read on follower     |
+| `snapshot_test.cpp`         | Unit               | Snapshot save/load, CRC, atomic writes             |
+| `integration_test.cpp`      | Integration        | Text + binary protocol, multi-connection            |
 
 Raft tests use a **mock transport layer** (no real TCP) with **deterministic timers** (manually advance time). This makes tests fast and reproducible.
