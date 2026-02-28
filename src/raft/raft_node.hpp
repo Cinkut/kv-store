@@ -208,6 +208,19 @@ public:
     // The on_apply callback will be invoked when it is committed.
     [[nodiscard]] bool submit(Command cmd);
 
+    // ── State restoration (call BEFORE start()) ────────────────────────────
+
+    // Restore persistent state from WAL replay.
+    // Must be called before start() to set the node's term, vote, and log.
+    // Does NOT trigger PersistCallback (data is already on disk).
+    void restore(uint64_t term, int32_t voted_for,
+                 std::vector<LogEntry> entries);
+
+    // Restore snapshot metadata (call after loading snapshot, before start).
+    // Sets the snapshot_last_included_index/term and adjusts the log offset.
+    void restore_snapshot(uint64_t last_included_index,
+                          uint64_t last_included_term);
+
     // ── State queries ────────────────────────────────────────────────────────
 
     [[nodiscard]] NodeState state() const noexcept { return state_; }

@@ -35,6 +35,45 @@ RaftNode::RaftNode(asio::io_context& ioc,
 {
 }
 
+// ── State restoration ────────────────────────────────────────────────────────
+
+void RaftNode::restore(uint64_t term, int32_t voted_for,
+                       std::vector<LogEntry> entries) {
+    current_term_ = term;
+    voted_for_ = voted_for >= 0
+        ? std::optional<uint32_t>{static_cast<uint32_t>(voted_for)}
+        : std::nullopt;
+
+    for (auto& entry : entries) {
+        log_.append(std::move(entry));
+    }
+
+    logger_->info("[restore] term={}, voted_for={}, log_entries={}",
+                  current_term_,
+                  voted_for_ ? static_cast<int32_t>(*voted_for_) : -1,
+                  log_.last_index());
+}
+
+void RaftNode::restore_snapshot(uint64_t last_included_index,
+                                uint64_t last_included_term) {
+    snapshot_last_included_index_ = last_included_index;
+    snapshot_last_included_term_  = last_included_term;
+
+    // Trim log entries covered by the snapshot.
+    log_.truncate_prefix(last_included_index, last_included_term);
+
+    // Advance commit_index and last_applied to snapshot point.
+    if (commit_index_ < last_included_index) {
+        commit_index_ = last_included_index;
+    }
+    if (last_applied_ < last_included_index) {
+        last_applied_ = last_included_index;
+    }
+
+    logger_->info("[restore] snapshot index={}, term={}", 
+                  last_included_index, last_included_term);
+}
+
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 void RaftNode::start() {

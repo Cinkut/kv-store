@@ -587,3 +587,170 @@ TEST_F(WalTest, PathReturnsConstructorPath) {
 }
 
 } // namespace kv::persistence
+
+// ════════════════════════════════════════════════════════════════════════════
+//  WalPersistCallback tests
+// ════════════════════════════════════════════════════════════════════════════
+
+#include "persistence/wal_persist_callback.hpp"
+#include "common/logger.hpp"
+
+namespace {
+
+class WalPersistCallbackTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        auto* info = ::testing::UnitTest::GetInstance()->current_test_info();
+        test_dir_ = std::filesystem::temp_directory_path() /
+                    ("wal_persist_cb_" + std::string(info->name()));
+        std::filesystem::remove_all(test_dir_);
+        std::filesystem::create_directories(test_dir_);
+        wal_path_ = test_dir_ / "test.wal";
+    }
+
+    void TearDown() override {
+        std::filesystem::remove_all(test_dir_);
+    }
+
+    std::filesystem::path test_dir_;
+    std::filesystem::path wal_path_;
+};
+
+TEST_F(WalPersistCallbackTest, PersistMetadataWritesToWAL) {
+    kv::persistence::WAL wal(wal_path_);
+    ASSERT_FALSE(wal.open());
+
+    auto logger = spdlog::default_logger();
+    kv::persistence::WalPersistCallback cb(wal, logger);
+
+    cb.persist_metadata(5, 2);
+    wal.close();
+
+    // Replay and verify metadata was persisted.
+    kv::persistence::WalReplayResult result;
+    auto ec = kv::persistence::WAL::replay(wal_path_, result);
+    ASSERT_FALSE(ec) << ec.message();
+    ASSERT_TRUE(result.metadata.has_value());
+    EXPECT_EQ(result.metadata->term, 5u);
+    EXPECT_EQ(result.metadata->voted_for, 2);
+}
+
+TEST_F(WalPersistCallbackTest, PersistMetadataWithNoVote) {
+    kv::persistence::WAL wal(wal_path_);
+    ASSERT_FALSE(wal.open());
+
+    auto logger = spdlog::default_logger();
+    kv::persistence::WalPersistCallback cb(wal, logger);
+
+    cb.persist_metadata(3, -1);
+    wal.close();
+
+    kv::persistence::WalReplayResult result;
+    ASSERT_FALSE(kv::persistence::WAL::replay(wal_path_, result));
+    ASSERT_TRUE(result.metadata.has_value());
+    EXPECT_EQ(result.metadata->term, 3u);
+    EXPECT_EQ(result.metadata->voted_for, -1);
+}
+
+TEST_F(WalPersistCallbackTest, PersistEntryWritesToWAL) {
+    kv::persistence::WAL wal(wal_path_);
+    ASSERT_FALSE(wal.open());
+
+    auto logger = spdlog::default_logger();
+    kv::persistence::WalPersistCallback cb(wal, logger);
+
+    kv::raft::LogEntry entry;
+    entry.set_term(2);
+    entry.set_index(1);
+    auto* cmd = entry.mutable_command();
+    cmd->set_type(kv::raft::CMD_SET);
+    cmd->set_key("foo");
+    cmd->set_value("bar");
+
+    cb.persist_entry(entry);
+    wal.close();
+
+    // Replay and verify the entry was persisted.
+    kv::persistence::WalReplayResult result;
+    ASSERT_FALSE(kv::persistence::WAL::replay(wal_path_, result));
+    ASSERT_EQ(result.entries.size(), 1u);
+    EXPECT_EQ(result.entries[0].term, 2u);
+    EXPECT_EQ(result.entries[0].index, 1u);
+    EXPECT_EQ(result.entries[0].cmd_type, static_cast<uint8_t>(kv::raft::CMD_SET));
+    EXPECT_EQ(result.entries[0].key, "foo");
+    EXPECT_EQ(result.entries[0].value, "bar");
+}
+
+TEST_F(WalPersistCallbackTest, PersistNoopEntry) {
+    kv::persistence::WAL wal(wal_path_);
+    ASSERT_FALSE(wal.open());
+
+    auto logger = spdlog::default_logger();
+    kv::persistence::WalPersistCallback cb(wal, logger);
+
+    kv::raft::LogEntry entry;
+    entry.set_term(1);
+    entry.set_index(1);
+    // No command set = NOOP
+
+    cb.persist_entry(entry);
+    wal.close();
+
+    kv::persistence::WalReplayResult result;
+    ASSERT_FALSE(kv::persistence::WAL::replay(wal_path_, result));
+    ASSERT_EQ(result.entries.size(), 1u);
+    EXPECT_EQ(result.entries[0].term, 1u);
+    EXPECT_EQ(result.entries[0].index, 1u);
+    EXPECT_EQ(result.entries[0].cmd_type, 0u); // NOOP
+}
+
+TEST_F(WalPersistCallbackTest, PersistMultipleEntriesAndMetadata) {
+    kv::persistence::WAL wal(wal_path_);
+    ASSERT_FALSE(wal.open());
+
+    auto logger = spdlog::default_logger();
+    kv::persistence::WalPersistCallback cb(wal, logger);
+
+    // Persist metadata.
+    cb.persist_metadata(1, 1);
+
+    // Persist two entries.
+    kv::raft::LogEntry e1;
+    e1.set_term(1);
+    e1.set_index(1);
+    auto* c1 = e1.mutable_command();
+    c1->set_type(kv::raft::CMD_SET);
+    c1->set_key("a");
+    c1->set_value("1");
+    cb.persist_entry(e1);
+
+    kv::raft::LogEntry e2;
+    e2.set_term(1);
+    e2.set_index(2);
+    auto* c2 = e2.mutable_command();
+    c2->set_type(kv::raft::CMD_DEL);
+    c2->set_key("b");
+    c2->set_value("");
+    cb.persist_entry(e2);
+
+    // Update metadata (new term, new vote).
+    cb.persist_metadata(2, 3);
+
+    wal.close();
+
+    // Replay should have latest metadata and both entries.
+    kv::persistence::WalReplayResult result;
+    ASSERT_FALSE(kv::persistence::WAL::replay(wal_path_, result));
+
+    ASSERT_TRUE(result.metadata.has_value());
+    // WAL replays all metadata records; the last one wins.
+    EXPECT_EQ(result.metadata->term, 2u);
+    EXPECT_EQ(result.metadata->voted_for, 3);
+
+    ASSERT_EQ(result.entries.size(), 2u);
+    EXPECT_EQ(result.entries[0].key, "a");
+    EXPECT_EQ(result.entries[1].key, "b");
+    EXPECT_EQ(result.entries[1].cmd_type, static_cast<uint8_t>(kv::raft::CMD_DEL));
+}
+
+} // anonymous namespace

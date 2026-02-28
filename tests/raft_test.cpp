@@ -2581,3 +2581,109 @@ TEST_F(RaftClusterContextTest, FailAllOnLeadershipLoss) {
     bundle.node->stop();
     pump(ioc);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//  RaftNode::restore() / restore_snapshot() tests
+// ════════════════════════════════════════════════════════════════════════════
+
+TEST_F(RaftNodeTest, RestoreTermAndVotedFor) {
+    RaftNode node(ioc_, 1, {2, 3}, transport_, timer_factory_, logger_);
+
+    // Restore term=5, voted_for=2
+    node.restore(5, 2, {});
+
+    EXPECT_EQ(node.current_term(), 5u);
+    EXPECT_EQ(node.voted_for(), 2u);
+    EXPECT_EQ(node.log().last_index(), 0u);
+}
+
+TEST_F(RaftNodeTest, RestoreTermWithNoVote) {
+    RaftNode node(ioc_, 1, {2, 3}, transport_, timer_factory_, logger_);
+
+    // Restore term=3, voted_for=-1 (no vote)
+    node.restore(3, -1, {});
+
+    EXPECT_EQ(node.current_term(), 3u);
+    EXPECT_FALSE(node.voted_for().has_value());
+}
+
+TEST_F(RaftNodeTest, RestoreWithLogEntries) {
+    RaftNode node(ioc_, 1, {2, 3}, transport_, timer_factory_, logger_);
+
+    std::vector<LogEntry> entries;
+    entries.push_back(make_entry(1, 1, CMD_SET, "a", "1"));
+    entries.push_back(make_entry(1, 2, CMD_SET, "b", "2"));
+    entries.push_back(make_entry(2, 3, CMD_DEL, "a", ""));
+
+    node.restore(2, 1, std::move(entries));
+
+    EXPECT_EQ(node.current_term(), 2u);
+    EXPECT_EQ(node.voted_for(), 1u);
+    EXPECT_EQ(node.log().last_index(), 3u);
+    EXPECT_EQ(node.log().last_term(), 2u);
+    EXPECT_EQ(node.log().size(), 3u);
+}
+
+TEST_F(RaftNodeTest, RestoreSnapshotAdjustsState) {
+    RaftNode node(ioc_, 1, {2, 3}, transport_, timer_factory_, logger_);
+
+    node.restore_snapshot(10, 3);
+
+    EXPECT_EQ(node.snapshot_last_index(), 10u);
+    EXPECT_EQ(node.snapshot_last_term(), 3u);
+    EXPECT_EQ(node.commit_index(), 10u);
+    EXPECT_EQ(node.last_applied(), 10u);
+}
+
+TEST_F(RaftNodeTest, RestoreSnapshotThenLogEntries) {
+    RaftNode node(ioc_, 1, {2, 3}, transport_, timer_factory_, logger_);
+
+    // Snapshot at index 5, term 2.
+    node.restore_snapshot(5, 2);
+
+    // Then restore entries after the snapshot.
+    std::vector<LogEntry> entries;
+    entries.push_back(make_entry(2, 6, CMD_SET, "x", "100"));
+    entries.push_back(make_entry(3, 7, CMD_SET, "y", "200"));
+    node.restore(3, -1, std::move(entries));
+
+    EXPECT_EQ(node.snapshot_last_index(), 5u);
+    EXPECT_EQ(node.snapshot_last_term(), 2u);
+    EXPECT_EQ(node.current_term(), 3u);
+    EXPECT_FALSE(node.voted_for().has_value());
+    EXPECT_EQ(node.log().last_index(), 7u);
+    EXPECT_EQ(node.log().last_term(), 3u);
+}
+
+TEST_F(RaftNodeTest, RestoreDoesNotTriggerPersistCallback) {
+    RecordingPersistCallback persist;
+    RaftNode node(ioc_, 1, {2, 3}, transport_, timer_factory_, logger_,
+                  {}, nullptr, 0, &persist);
+
+    std::vector<LogEntry> entries;
+    entries.push_back(make_entry(1, 1, CMD_SET, "k", "v"));
+    node.restore(1, 1, std::move(entries));
+
+    // restore() must NOT call the persist callback (data is already on disk).
+    EXPECT_TRUE(persist.metadata_calls().empty());
+    EXPECT_TRUE(persist.entry_calls().empty());
+}
+
+TEST_F(RaftNodeTest, RestoreThenStartWorksNormally) {
+    RaftNode node(ioc_, 1, {2, 3}, transport_, timer_factory_, logger_);
+
+    std::vector<LogEntry> entries;
+    entries.push_back(make_entry(1, 1, CMD_SET, "a", "1"));
+    node.restore(1, -1, std::move(entries));
+
+    // Node should start normally after restore.
+    node.start();
+    pump(ioc_);
+
+    EXPECT_EQ(node.state(), kv::NodeState::Follower);
+    EXPECT_EQ(node.current_term(), 1u);
+    EXPECT_EQ(node.log().last_index(), 1u);
+
+    node.stop();
+    pump(ioc_);
+}
