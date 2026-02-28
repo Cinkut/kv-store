@@ -42,7 +42,7 @@ public:
 // strand owned by the parent Server.
 //
 // Protocol auto-detection: the first byte received determines the protocol.
-// Bytes 0x00–0x1F → binary protocol, 0x20–0x7F → text protocol.
+// Bytes 0x00–0x1F → binary, {$,*,+,-,:} → RESP, rest of 0x20–0x7F → text.
 class Session {
 public:
     // Standalone mode (no Raft) – all commands execute locally.
@@ -74,6 +74,11 @@ private:
     // `first_header` contains the already-read first 5-byte header.
     boost::asio::awaitable<void> run_binary(const std::string& remote,
                                             std::vector<uint8_t> first_header);
+
+    // RESP protocol loop: reads RESP arrays, dispatches commands.
+    // `first_byte` is the already-consumed auto-detect byte.
+    boost::asio::awaitable<void> run_resp(const std::string& remote,
+                                          uint8_t first_byte);
 
     boost::asio::ip::tcp::socket socket_;
     Storage& storage_;

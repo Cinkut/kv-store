@@ -1,6 +1,7 @@
 #include "network/session.hpp"
 #include "network/binary_protocol.hpp"
 #include "network/protocol.hpp"
+#include "network/resp_protocol.hpp"
 
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/buffer.hpp>
@@ -67,6 +68,10 @@ boost::asio::awaitable<void> Session::run() {
         }
 
         co_await run_binary(remote, std::move(first_header));
+    } else if (is_resp_protocol(first_byte)) {
+        spdlog::debug("Session {}: detected RESP protocol (first byte 0x{:02x})",
+                       remote, first_byte);
+        co_await run_resp(remote, first_byte);
     } else {
         spdlog::debug("Session {}: detected text protocol (first byte 0x{:02x})",
                        remote, first_byte);
@@ -197,6 +202,48 @@ Session::process_request(std::variant<Command, ErrorResp>& parse_result) {
         co_return std::get<ErrorResp>(parse_result);
     }
     co_return co_await dispatch(std::get<Command>(parse_result));
+}
+
+boost::asio::awaitable<void> Session::run_resp(const std::string& remote,
+                                                uint8_t first_byte) {
+    std::string buf;
+    buf.reserve(256);
+
+    for (;;) {
+        // Parse one RESP request.
+        auto parse_result = co_await parse_resp_request(socket_, first_byte, buf);
+
+        Response response = co_await process_request(parse_result);
+
+        // Serialize and send RESP response.
+        const std::string wire = serialize_resp_response(response);
+
+        auto [wec, _] = co_await boost::asio::async_write(
+            socket_, boost::asio::buffer(wire), use_awaitable);
+
+        if (wec) {
+            spdlog::warn("Session {}: RESP write error: {}", remote, wec.message());
+            break;
+        }
+
+        // For subsequent requests, read the first byte of the next command.
+        // But first check if the buf already has data from a previous read_until.
+        if (!buf.empty()) {
+            first_byte = static_cast<uint8_t>(buf[0]);
+            buf.erase(0, 1);
+        } else {
+            auto [ec, n] = co_await boost::asio::async_read(
+                socket_, boost::asio::buffer(&first_byte, 1), use_awaitable);
+
+            if (ec) {
+                if (ec != boost::asio::error::eof &&
+                    ec != boost::asio::error::connection_reset) {
+                    spdlog::warn("Session {}: RESP read error: {}", remote, ec.message());
+                }
+                break;
+            }
+        }
+    }
 }
 
 boost::asio::awaitable<Response> Session::dispatch(const Command& cmd) {

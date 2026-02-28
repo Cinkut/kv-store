@@ -479,4 +479,152 @@ TEST_F(BinaryIntegrationTest, EmptyKey) {
     EXPECT_NE(get<ErrorResp>(resp).message.find("empty key"), std::string::npos);
 }
 
+// ===========================================================================
+// RESP protocol integration tests
+// ===========================================================================
+
+class RespSyncClient {
+public:
+    explicit RespSyncClient(std::uint16_t port = TEST_PORT) : ioc_(1), socket_(ioc_) {
+        tcp::resolver resolver{ioc_};
+        auto endpoints = resolver.resolve(TEST_HOST, std::to_string(port));
+        boost::asio::connect(socket_, endpoints);
+    }
+
+    // Send a raw RESP request string.
+    void send_raw(const std::string& data) {
+        boost::asio::write(socket_, boost::asio::buffer(data));
+    }
+
+    // Send a RESP array command (e.g., {"SET", "key", "value"}).
+    void send(const std::vector<std::string>& args) {
+        std::string wire = "*" + std::to_string(args.size()) + "\r\n";
+        for (const auto& a : args) {
+            wire += "$" + std::to_string(a.size()) + "\r\n" + a + "\r\n";
+        }
+        send_raw(wire);
+    }
+
+    // Read one CRLF-terminated line from the persistent buffer + socket.
+    std::string recv_line() {
+        for (;;) {
+            // Check if we already have a complete line in the buffer.
+            auto pos = buf_.find("\r\n");
+            if (pos != std::string::npos) {
+                std::string line = buf_.substr(0, pos);
+                buf_.erase(0, pos + 2);
+                return line;
+            }
+            // Read more data.
+            char tmp[256];
+            auto n = socket_.read_some(boost::asio::buffer(tmp));
+            buf_.append(tmp, n);
+        }
+    }
+
+    // Simple RESP command: send array, read one response line.
+    std::string cmd(const std::vector<std::string>& args) {
+        send(args);
+        return recv_line();
+    }
+
+    // Read a bulk string response ($len\r\ndata\r\n).
+    std::string recv_bulk() {
+        std::string header = recv_line();
+        if (header.empty() || header[0] != '$') return header;
+        int len = std::stoi(header.substr(1));
+        if (len < 0) return "$-1"; // null bulk
+        // Need exactly len + 2 bytes (data + \r\n) from the buffer.
+        std::size_t need = static_cast<std::size_t>(len) + 2;
+        while (buf_.size() < need) {
+            char tmp[256];
+            auto n = socket_.read_some(boost::asio::buffer(tmp));
+            buf_.append(tmp, n);
+        }
+        std::string data = buf_.substr(0, static_cast<std::size_t>(len));
+        buf_.erase(0, need);
+        return data;
+    }
+
+    // Send command, expect bulk string response.
+    std::string cmd_bulk(const std::vector<std::string>& args) {
+        send(args);
+        return recv_bulk();
+    }
+
+private:
+    io_ctx      ioc_;
+    tcp::socket socket_;
+    std::string buf_;  // persistent read buffer
+};
+
+class RespIntegrationTest : public ::testing::Test {
+protected:
+    static constexpr std::uint16_t kRespPort = 17383;
+
+    void SetUp() override {
+        server_ = std::make_unique<kv::network::Server>(TEST_HOST, kRespPort, storage_);
+        server_thread_ = std::thread([this] { server_->run(); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    void TearDown() override {
+        server_->stop();
+        if (server_thread_.joinable()) {
+            server_thread_.join();
+        }
+    }
+
+    kv::Storage storage_;
+    std::unique_ptr<kv::network::Server> server_;
+    std::thread server_thread_;
+};
+
+TEST_F(RespIntegrationTest, Ping) {
+    RespSyncClient client(kRespPort);
+    EXPECT_EQ(client.cmd({"PING"}), "+PONG");
+}
+
+TEST_F(RespIntegrationTest, SetAndGet) {
+    RespSyncClient client(kRespPort);
+    EXPECT_EQ(client.cmd({"SET", "hello", "world"}), "+OK");
+    EXPECT_EQ(client.cmd_bulk({"GET", "hello"}), "world");
+}
+
+TEST_F(RespIntegrationTest, GetNotFound) {
+    RespSyncClient client(kRespPort);
+    auto resp = client.cmd_bulk({"GET", "nonexistent"});
+    EXPECT_EQ(resp, "$-1");
+}
+
+TEST_F(RespIntegrationTest, Del) {
+    RespSyncClient client(kRespPort);
+    EXPECT_EQ(client.cmd({"SET", "foo", "bar"}), "+OK");
+    EXPECT_EQ(client.cmd({"DEL", "foo"}), ":1");
+    auto resp = client.cmd_bulk({"GET", "foo"});
+    EXPECT_EQ(resp, "$-1");
+}
+
+TEST_F(RespIntegrationTest, UnknownCommand) {
+    RespSyncClient client(kRespPort);
+    auto resp = client.cmd({"FOOBAR"});
+    EXPECT_TRUE(resp.starts_with("-ERR"));
+    EXPECT_TRUE(resp.find("unknown") != std::string::npos);
+}
+
+TEST_F(RespIntegrationTest, CaseInsensitive) {
+    RespSyncClient client(kRespPort);
+    EXPECT_EQ(client.cmd({"ping"}), "+PONG");
+    EXPECT_EQ(client.cmd({"set", "k", "v"}), "+OK");
+    EXPECT_EQ(client.cmd_bulk({"get", "k"}), "v");
+}
+
+TEST_F(RespIntegrationTest, MultipleCommandsOneConnection) {
+    RespSyncClient client(kRespPort);
+    EXPECT_EQ(client.cmd({"SET", "a", "1"}), "+OK");
+    EXPECT_EQ(client.cmd({"SET", "b", "2"}), "+OK");
+    EXPECT_EQ(client.cmd_bulk({"GET", "a"}), "1");
+    EXPECT_EQ(client.cmd_bulk({"GET", "b"}), "2");
+}
+
 } // anonymous namespace

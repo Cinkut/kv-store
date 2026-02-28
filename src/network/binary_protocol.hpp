@@ -38,9 +38,19 @@ inline constexpr std::size_t kHeaderSize = 5;
 // ── Auto-detection ────────────────────────────────────────────────────────────
 
 // Returns true if the first byte indicates a binary-protocol connection.
-// Binary: 0x00–0x1F, Text: 0x20–0x7F.
+// Binary: 0x00–0x1F (control bytes used as message types).
 [[nodiscard]] constexpr bool is_binary_protocol(uint8_t first_byte) noexcept {
     return first_byte <= 0x1F;
+}
+
+// Returns true if the first byte indicates a RESP protocol connection.
+// RESP type prefixes: * (0x2A), + (0x2B), - (0x2D), $ (0x24), : (0x3A).
+[[nodiscard]] constexpr bool is_resp_protocol(uint8_t first_byte) noexcept {
+    return first_byte == '*'
+        || first_byte == '+'
+        || first_byte == '-'
+        || first_byte == '$'
+        || first_byte == ':';
 }
 
 // ── Binary protocol functions ─────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 #include "common/logger.hpp"
 #include "network/binary_protocol.hpp"
 #include "network/protocol.hpp"
+#include "network/resp_protocol.hpp"
 
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/connect.hpp>
@@ -211,6 +212,62 @@ asio::awaitable<void> repl_binary(tcp::socket socket) {
     }
 }
 
+// ── RESP REPL coroutine ───────────────────────────────────────────────────────
+
+asio::awaitable<void> repl_resp(tcp::socket socket) {
+    using namespace kv;
+    using namespace kv::network;
+
+    std::string line;
+    while (true) {
+        fprintf(stdout, "> ");
+        fflush(stdout);
+
+        if (!std::getline(std::cin, line)) {
+            fprintf(stdout, "\n");
+            break;
+        }
+
+        if (line.empty()) {
+            continue;
+        }
+
+        // Parse the text input into a Command.
+        auto parse_result = parse_command(line);
+
+        if (std::holds_alternative<ErrorResp>(parse_result)) {
+            fprintf(stdout, "ERROR %s\n",
+                    std::get<ErrorResp>(parse_result).message.c_str());
+            continue;
+        }
+
+        const auto& cmd = std::get<Command>(parse_result);
+
+        // Serialize to RESP wire format.
+        auto wire = serialize_resp_request(cmd);
+
+        auto [wec, _] = co_await asio::async_write(
+            socket, asio::buffer(wire), use_awaitable);
+
+        if (wec) {
+            spdlog::error("kv-cli: send error: {}", wec.message());
+            break;
+        }
+
+        // Read the RESP response.
+        auto resp_result = co_await read_resp_response(socket);
+
+        if (std::holds_alternative<ErrorResp>(resp_result)) {
+            fprintf(stdout, "ERROR %s\n",
+                    std::get<ErrorResp>(resp_result).message.c_str());
+            continue;
+        }
+
+        const auto& resp = std::get<Response>(resp_result);
+        fprintf(stdout, "%s\n", format_response(resp).c_str());
+    }
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
@@ -220,6 +277,7 @@ int main(int argc, char* argv[]) {
         ("host",   po::value<std::string>()->default_value("127.0.0.1"), "Server host")
         ("port,p", po::value<std::uint16_t>()->default_value(6379),      "Server port")
         ("binary,b",                                          "Use binary protocol")
+        ("resp,r",                                              "Use RESP (Redis) protocol")
         ("log-level,l", po::value<std::string>()->default_value("warn"), "Log level");
 
     po::variables_map vm;
@@ -242,11 +300,17 @@ int main(int argc, char* argv[]) {
     const auto port      = vm["port"].as<std::uint16_t>();
     const auto log_level = vm["log-level"].as<std::string>();
     const bool binary    = vm.count("binary") > 0;
+    const bool resp      = vm.count("resp") > 0;
+
+    if (binary && resp) {
+        fprintf(stderr, "Error: --binary and --resp are mutually exclusive\n");
+        return 1;
+    }
 
     kv::init_default_logger(kv::parse_log_level(log_level));
 
-    spdlog::debug("kv-cli connecting to {}:{} ({})", host, port,
-                  binary ? "binary" : "text");
+    const char* mode_str = resp ? "resp" : (binary ? "binary" : "text");
+    spdlog::debug("kv-cli connecting to {}:{} ({})", host, port, mode_str);
 
     try {
         asio::io_context ioc;
@@ -266,9 +330,11 @@ int main(int argc, char* argv[]) {
 
         fprintf(stdout, "Connected to %s:%u (%s mode). "
                 "Type commands (PING, SET k v, GET k, DEL k, KEYS). Ctrl+D to quit.\n",
-                host.c_str(), port, binary ? "binary" : "text");
+                host.c_str(), port, mode_str);
 
-        if (binary) {
+        if (resp) {
+            asio::co_spawn(ioc, repl_resp(std::move(socket)), asio::detached);
+        } else if (binary) {
             asio::co_spawn(ioc, repl_binary(std::move(socket)), asio::detached);
         } else {
             asio::co_spawn(ioc, repl_text(std::move(socket)), asio::detached);

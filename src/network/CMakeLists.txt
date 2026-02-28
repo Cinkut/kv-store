@@ -3,6 +3,7 @@ add_library(kv_network STATIC
     session.cpp
     protocol.cpp
     binary_protocol.cpp
+    resp_protocol.cpp
     peer_client.cpp
     peer_manager.cpp
 )
