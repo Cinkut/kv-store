@@ -64,6 +64,40 @@ public:
     virtual std::unique_ptr<Timer> create_timer() = 0;
 };
 
+// ── SnapshotIO abstraction ───────────────────────────────────────────────────
+//
+// Decouples RaftNode from file-system snapshot operations.  Production code
+// uses the real Snapshot/WAL/Storage classes; tests inject a mock.
+
+class SnapshotIO {
+public:
+    virtual ~SnapshotIO() = default;
+
+    // Load snapshot data bytes for sending via InstallSnapshot RPC.
+    // Returns serialized snapshot bytes (the raw binary data field),
+    // along with the metadata (last_included_index, last_included_term).
+    // Returns empty bytes if no snapshot exists.
+    struct SnapshotData {
+        std::string data;               // raw snapshot bytes
+        uint64_t last_included_index = 0;
+        uint64_t last_included_term  = 0;
+    };
+    virtual SnapshotData load_snapshot_for_sending() = 0;
+
+    // Install a snapshot received from the leader.  The implementation should:
+    //   1. Save the snapshot data to disk
+    //   2. Clear and reload the state machine (Storage) from snapshot data
+    // Returns true on success.
+    virtual bool install_snapshot(const std::string& data,
+                                 uint64_t last_included_index,
+                                 uint64_t last_included_term) = 0;
+
+    // Create a snapshot of the current state machine and truncate WAL.
+    // Returns true on success.
+    virtual bool create_snapshot(uint64_t last_included_index,
+                                uint64_t last_included_term) = 0;
+};
+
 // ── RaftNode ─────────────────────────────────────────────────────────────────
 //
 // Core Raft consensus state machine.
@@ -90,13 +124,17 @@ public:
     //   timer_factory – timer creation (owned externally; must outlive RaftNode)
     //   logger       – per-node spdlog logger
     //   on_apply     – callback for committed entries
+    //   snapshot_io  – snapshot persistence (optional; null disables snapshot)
+    //   snapshot_interval – entries applied between snapshots (0 = no auto-snapshot)
     RaftNode(boost::asio::io_context& ioc,
              uint32_t node_id,
              std::vector<uint32_t> peer_ids,
              Transport& transport,
              TimerFactory& timer_factory,
              std::shared_ptr<spdlog::logger> logger,
-             ApplyCallback on_apply = {});
+             ApplyCallback on_apply = {},
+             SnapshotIO* snapshot_io = nullptr,
+             uint64_t snapshot_interval = 0);
 
     ~RaftNode() = default;
 
@@ -130,6 +168,14 @@ public:
     void handle_append_entries_response(uint32_t from_peer,
                                         const AppendEntriesResponse& resp);
 
+    // Handle an incoming InstallSnapshot request.  Returns the response.
+    boost::asio::awaitable<InstallSnapshotResponse>
+    handle_install_snapshot(const InstallSnapshotRequest& req);
+
+    // Handle an incoming InstallSnapshot response (from a peer we sent snapshot to).
+    void handle_install_snapshot_response(uint32_t from_peer,
+                                          const InstallSnapshotResponse& resp);
+
     // Dispatch an incoming RaftMessage from a peer to the appropriate handler.
     // Returns the response message to send back (if any), or nullopt for
     // response-type messages (vote resp, AE resp) which are handled internally.
@@ -153,6 +199,10 @@ public:
     [[nodiscard]] uint64_t commit_index() const noexcept { return commit_index_; }
     [[nodiscard]] uint64_t last_applied() const noexcept { return last_applied_; }
     [[nodiscard]] const RaftLog& log() const noexcept { return log_; }
+
+    // Snapshot state queries.
+    [[nodiscard]] uint64_t snapshot_last_index() const noexcept { return snapshot_last_included_index_; }
+    [[nodiscard]] uint64_t snapshot_last_term() const noexcept { return snapshot_last_included_term_; }
 
     // ── Strand accessor (for external dispatch) ──────────────────────────────
     [[nodiscard]] boost::asio::strand<boost::asio::io_context::executor_type>&
@@ -189,11 +239,17 @@ private:
     // Send AppendEntries to a single peer.
     boost::asio::awaitable<void> send_append_entries_to(uint32_t peer_id);
 
+    // Send InstallSnapshot to a single peer.
+    boost::asio::awaitable<void> send_install_snapshot_to(uint32_t peer_id);
+
     // Try to advance commitIndex based on matchIndex majority.
     void try_advance_commit();
 
     // Apply committed entries to the state machine.
     void apply_committed_entries();
+
+    // Check if we should create a snapshot and do so if needed.
+    void maybe_trigger_snapshot();
 
     // ── Helper ───────────────────────────────────────────────────────────────
 
@@ -218,6 +274,8 @@ private:
     TimerFactory& timer_factory_;
     std::shared_ptr<spdlog::logger> logger_;
     ApplyCallback on_apply_;
+    SnapshotIO* snapshot_io_;        // optional; null = no snapshot support
+    uint64_t snapshot_interval_;     // 0 = no auto-snapshot
 
     // Persistent state (Raft §5.2).
     uint64_t current_term_ = 0;
@@ -229,6 +287,10 @@ private:
     uint64_t commit_index_ = 0;
     uint64_t last_applied_ = 0;
     std::optional<uint32_t> leader_id_;
+
+    // Snapshot state.
+    uint64_t snapshot_last_included_index_ = 0;
+    uint64_t snapshot_last_included_term_  = 0;
 
     // Volatile state (leader only).
     std::map<uint32_t, uint64_t> next_index_;

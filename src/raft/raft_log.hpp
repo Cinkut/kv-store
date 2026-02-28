@@ -59,6 +59,13 @@ public:
     // Remove all entries with index > `last_kept_index`.
     void truncate_after(uint64_t last_kept_index);
 
+    // Discard all entries with index <= `new_offset`.
+    // After this call, offset_ == new_offset, and only entries after new_offset
+    // remain.  Used after snapshot installation to trim prefix.
+    // `snapshot_last_term` is the term of the last included entry in the
+    // snapshot, used for term_at(offset_) and last_term() when log is empty.
+    void truncate_prefix(uint64_t new_offset, uint64_t snapshot_last_term);
+
     // Return entries in the half-open range [from_index, to_index].
     // Both bounds are inclusive.  Returns empty vector if range is invalid.
     [[nodiscard]] std::vector<LogEntry> entries_from(uint64_t from_index,
@@ -67,11 +74,20 @@ public:
     // Return all entries from from_index to end.
     [[nodiscard]] std::vector<LogEntry> entries_from(uint64_t from_index) const;
 
+    // ── Snapshot-aware queries ───────────────────────────────────────────────
+
+    // The log offset (entries with index <= offset have been snapshotted).
+    [[nodiscard]] uint64_t offset() const noexcept { return offset_; }
+
+    // The term of the snapshot's last included entry (0 if no snapshot).
+    [[nodiscard]] uint64_t snapshot_last_term() const noexcept { return snapshot_last_term_; }
+
 private:
     // entries_[0] corresponds to log index (offset_ + 1).
     // With no snapshot truncation, offset_ == 0 and entries_[i] has index i+1.
     std::vector<LogEntry> entries_;
-    uint64_t offset_ = 0;  // reserved for snapshot support (Etap 4)
+    uint64_t offset_ = 0;            // entries with index <= offset_ are snapshotted
+    uint64_t snapshot_last_term_ = 0; // term of the entry at offset_ (from snapshot)
 
     // Convert Raft 1-based index to vector position.  Returns nullopt if OOB.
     [[nodiscard]] std::optional<std::size_t> to_pos(uint64_t index) const noexcept;

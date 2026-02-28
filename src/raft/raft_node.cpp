@@ -18,7 +18,9 @@ RaftNode::RaftNode(asio::io_context& ioc,
                    Transport& transport,
                    TimerFactory& timer_factory,
                    std::shared_ptr<spdlog::logger> logger,
-                   ApplyCallback on_apply)
+                   ApplyCallback on_apply,
+                   SnapshotIO* snapshot_io,
+                   uint64_t snapshot_interval)
     : strand_(asio::make_strand(ioc))
     , node_id_(node_id)
     , peer_ids_(std::move(peer_ids))
@@ -26,6 +28,8 @@ RaftNode::RaftNode(asio::io_context& ioc,
     , timer_factory_(timer_factory)
     , logger_(std::move(logger))
     , on_apply_(std::move(on_apply))
+    , snapshot_io_(snapshot_io)
+    , snapshot_interval_(snapshot_interval)
 {
 }
 
@@ -226,8 +230,109 @@ void RaftNode::handle_append_entries_response(uint32_t from_peer,
                        current_term_, from_peer, next_index_[from_peer]);
 
         // Immediately retry with lower nextIndex.
+        // send_append_entries_to will decide whether to send AE or InstallSnapshot.
         asio::co_spawn(strand_, send_append_entries_to(from_peer), asio::detached);
     }
+}
+
+// ── InstallSnapshot handlers ─────────────────────────────────────────────
+
+asio::awaitable<InstallSnapshotResponse>
+RaftNode::handle_install_snapshot(const InstallSnapshotRequest& req) {
+    InstallSnapshotResponse resp;
+    resp.set_term(current_term_);
+
+    // Step down if incoming term is higher.
+    if (req.term() > current_term_) {
+        become_follower(req.term());
+        resp.set_term(current_term_);
+    }
+
+    // Reject if stale term.
+    if (req.term() < current_term_) {
+        logger_->debug("[term={}] Rejecting InstallSnapshot from node {} (stale term {})",
+                       current_term_, req.leader_id(), req.term());
+        co_return resp;
+    }
+
+    // Valid InstallSnapshot from current leader.
+    if (state_ != NodeState::Follower) {
+        become_follower(req.term());
+        resp.set_term(current_term_);
+    }
+
+    leader_id_ = req.leader_id();
+    reset_election_timer();
+
+    // If snapshot is not newer than our current state, ignore.
+    if (req.last_included_index() <= snapshot_last_included_index_) {
+        logger_->debug("[term={}] Ignoring InstallSnapshot (index {} <= our snapshot {})",
+                       current_term_, req.last_included_index(),
+                       snapshot_last_included_index_);
+        co_return resp;
+    }
+
+    // Install the snapshot via the I/O layer.
+    if (snapshot_io_) {
+        bool ok = snapshot_io_->install_snapshot(
+            req.data(), req.last_included_index(), req.last_included_term());
+        if (!ok) {
+            logger_->warn("[term={}] Failed to install snapshot from node {}",
+                          current_term_, req.leader_id());
+            co_return resp;
+        }
+    }
+
+    // Update snapshot state.
+    snapshot_last_included_index_ = req.last_included_index();
+    snapshot_last_included_term_  = req.last_included_term();
+
+    // Truncate log: discard all entries up through the snapshot index.
+    log_.truncate_prefix(req.last_included_index(), req.last_included_term());
+
+    // Update commitIndex and lastApplied.
+    if (req.last_included_index() > commit_index_) {
+        commit_index_ = req.last_included_index();
+    }
+    if (req.last_included_index() > last_applied_) {
+        last_applied_ = req.last_included_index();
+    }
+
+    logger_->info("[term={}] Installed snapshot from node {} "
+                  "(lastIncludedIndex={}, lastIncludedTerm={})",
+                  current_term_, req.leader_id(),
+                  req.last_included_index(), req.last_included_term());
+
+    co_return resp;
+}
+
+void RaftNode::handle_install_snapshot_response(uint32_t from_peer,
+                                                 const InstallSnapshotResponse& resp) {
+    // Ignore if we're no longer leader.
+    if (state_ != NodeState::Leader) return;
+
+    // Step down if response has a higher term.
+    if (resp.term() > current_term_) {
+        logger_->info("[term={}] InstallSnapshot response from node {} has higher term {}; "
+                      "stepping down",
+                      current_term_, from_peer, resp.term());
+        become_follower(resp.term());
+        return;
+    }
+
+    // Ignore stale responses.
+    if (resp.term() != current_term_) return;
+
+    // Snapshot was accepted: update nextIndex and matchIndex to snapshot's end.
+    next_index_[from_peer] = snapshot_last_included_index_ + 1;
+    match_index_[from_peer] = snapshot_last_included_index_;
+
+    logger_->debug("[term={}] InstallSnapshot accepted by node {} "
+                   "(nextIndex={}, matchIndex={})",
+                   current_term_, from_peer,
+                   next_index_[from_peer], match_index_[from_peer]);
+
+    try_advance_commit();
 }
 
 asio::awaitable<std::optional<RaftMessage>>
@@ -253,6 +358,18 @@ RaftNode::handle_message(uint32_t from_peer, const RaftMessage& msg) {
 
     if (msg.has_append_entries_resp()) {
         handle_append_entries_response(from_peer, msg.append_entries_resp());
+        co_return std::nullopt;
+    }
+
+    if (msg.has_install_snapshot_req()) {
+        auto resp = co_await handle_install_snapshot(msg.install_snapshot_req());
+        RaftMessage reply;
+        *reply.mutable_install_snapshot_resp() = std::move(resp);
+        co_return reply;
+    }
+
+    if (msg.has_install_snapshot_resp()) {
+        handle_install_snapshot_response(from_peer, msg.install_snapshot_resp());
         co_return std::nullopt;
     }
 
@@ -431,6 +548,14 @@ asio::awaitable<void> RaftNode::send_append_entries_to(uint32_t peer_id) {
     if (state_ != NodeState::Leader) co_return;
 
     uint64_t next = next_index_[peer_id];
+
+    // If the peer needs entries that have been compacted by a snapshot,
+    // send InstallSnapshot instead.
+    if (next <= snapshot_last_included_index_ && snapshot_last_included_index_ > 0) {
+        co_await send_install_snapshot_to(peer_id);
+        co_return;
+    }
+
     uint64_t prev_log_index = next - 1;
     uint64_t prev_log_term = 0;
     if (prev_log_index > 0) {
@@ -456,6 +581,35 @@ asio::awaitable<void> RaftNode::send_append_entries_to(uint32_t peer_id) {
 
     logger_->debug("[term={}] Sending AppendEntries to node {} (prevIdx={}, entries={})",
                    current_term_, peer_id, prev_log_index, entries.size());
+
+    co_await transport_.send(peer_id, std::move(msg));
+}
+
+asio::awaitable<void> RaftNode::send_install_snapshot_to(uint32_t peer_id) {
+    if (state_ != NodeState::Leader) co_return;
+    if (!snapshot_io_) co_return;
+
+    auto snap = snapshot_io_->load_snapshot_for_sending();
+    if (snap.data.empty()) {
+        logger_->warn("[term={}] No snapshot available to send to node {}",
+                      current_term_, peer_id);
+        co_return;
+    }
+
+    InstallSnapshotRequest req;
+    req.set_term(current_term_);
+    req.set_leader_id(node_id_);
+    req.set_last_included_index(snap.last_included_index);
+    req.set_last_included_term(snap.last_included_term);
+    req.set_data(std::move(snap.data));
+
+    RaftMessage msg;
+    *msg.mutable_install_snapshot_req() = std::move(req);
+
+    logger_->info("[term={}] Sending InstallSnapshot to node {} "
+                  "(lastIncludedIndex={}, lastIncludedTerm={})",
+                  current_term_, peer_id,
+                  snap.last_included_index, snap.last_included_term);
 
     co_await transport_.send(peer_id, std::move(msg));
 }
@@ -495,6 +649,33 @@ void RaftNode::apply_committed_entries() {
         if (entry && on_apply_) {
             on_apply_(*entry);
         }
+    }
+    maybe_trigger_snapshot();
+}
+
+void RaftNode::maybe_trigger_snapshot() {
+    if (snapshot_interval_ == 0 || !snapshot_io_) return;
+
+    uint64_t entries_since_snapshot = last_applied_ - snapshot_last_included_index_;
+    if (entries_since_snapshot < snapshot_interval_) return;
+
+    // Get the term of the last applied entry.
+    uint64_t snap_term = 0;
+    auto t = log_.term_at(last_applied_);
+    if (t) snap_term = *t;
+
+    logger_->info("[term={}] Triggering snapshot at index {} (term={})",
+                  current_term_, last_applied_, snap_term);
+
+    bool ok = snapshot_io_->create_snapshot(last_applied_, snap_term);
+    if (ok) {
+        snapshot_last_included_index_ = last_applied_;
+        snapshot_last_included_term_  = snap_term;
+        log_.truncate_prefix(last_applied_, snap_term);
+        logger_->info("[term={}] Snapshot created, log truncated (offset={})",
+                      current_term_, log_.offset());
+    } else {
+        logger_->warn("[term={}] Snapshot creation failed", current_term_);
     }
 }
 

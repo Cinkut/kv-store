@@ -49,4 +49,12 @@ void StateMachine::apply(const LogEntry& entry) {
     last_applied_ = entry.index();
 }
 
+void StateMachine::reset(uint64_t new_last_applied) {
+    storage_.clear();
+    last_applied_ = new_last_applied;
+    if (logger_) {
+        logger_->info("[apply] State machine reset (lastApplied={})", new_last_applied);
+    }
+}
+
 } // namespace kv::raft

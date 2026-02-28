@@ -12,12 +12,14 @@ uint64_t RaftLog::last_index() const noexcept {
 }
 
 uint64_t RaftLog::last_term() const noexcept {
-    if (entries_.empty()) return 0;
+    if (entries_.empty()) return snapshot_last_term_;
     return entries_.back().term();
 }
 
 std::optional<uint64_t> RaftLog::term_at(uint64_t index) const noexcept {
     if (index == 0) return 0;  // sentinel: term 0 at index 0
+    // If index == offset_, return the snapshot's last term.
+    if (index == offset_ && offset_ > 0) return snapshot_last_term_;
     auto pos = to_pos(index);
     if (!pos) return std::nullopt;
     return entries_[*pos].term();
@@ -87,6 +89,27 @@ void RaftLog::truncate_after(uint64_t last_kept_index) {
     if (pos) {
         entries_.resize(*pos + 1);
     }
+}
+
+void RaftLog::truncate_prefix(uint64_t new_offset, uint64_t snapshot_last_term) {
+    if (new_offset <= offset_) return;
+
+    snapshot_last_term_ = snapshot_last_term;
+
+    if (new_offset >= last_index()) {
+        // All entries are covered by the snapshot.
+        entries_.clear();
+        offset_ = new_offset;
+        return;
+    }
+
+    // Discard entries with index <= new_offset.
+    auto pos = to_pos(new_offset);
+    if (pos) {
+        entries_.erase(entries_.begin(),
+                       entries_.begin() + static_cast<std::ptrdiff_t>(*pos + 1));
+    }
+    offset_ = new_offset;
 }
 
 std::vector<LogEntry> RaftLog::entries_from(uint64_t from_index,

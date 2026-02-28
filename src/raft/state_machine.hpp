@@ -26,6 +26,11 @@ public:
     // Skips NOOP entries.  Updates last_applied_.
     void apply(const LogEntry& entry);
 
+    // Reset the state machine: clear storage and set last_applied.
+    // Used when installing a snapshot — caller loads snapshot data into
+    // storage separately.
+    void reset(uint64_t new_last_applied);
+
     // Last log index that was applied.
     [[nodiscard]] uint64_t last_applied() const noexcept { return last_applied_; }
 
