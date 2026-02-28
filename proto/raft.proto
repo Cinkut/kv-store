@@ -5,9 +5,10 @@ package kv.raft;
 // --- Log Entry ---
 
 enum CommandType {
-    CMD_NOOP = 0;      // Leader's first entry each term (no-op)
-    CMD_SET  = 1;
-    CMD_DEL  = 2;
+    CMD_NOOP   = 0;      // Leader's first entry each term (no-op)
+    CMD_SET    = 1;
+    CMD_DEL    = 2;
+    CMD_CONFIG = 3;      // Cluster configuration change (joint consensus)
 }
 
 message Command {
@@ -16,10 +17,30 @@ message Command {
     string value     = 3;   // empty for DEL and NOOP
 }
 
+// --- Cluster Configuration (for dynamic membership) ---
+
+// Describes a single node in the cluster.
+message NodeInfo {
+    uint32 id          = 1;  // unique node ID (> 0)
+    string host        = 2;  // bind address / hostname
+    uint32 raft_port   = 3;  // port for Raft RPC
+    uint32 client_port = 4;  // port for client connections
+}
+
+// A cluster configuration: the set of nodes that form the Raft group.
+// During joint consensus, both old_nodes and new_nodes are populated.
+// In a stable (non-transitional) configuration, only new_nodes is used
+// and old_nodes is empty.
+message ClusterConfig {
+    repeated NodeInfo old_nodes = 1;  // C_old members (empty when not in joint phase)
+    repeated NodeInfo new_nodes = 2;  // C_new members (the target configuration)
+}
+
 message LogEntry {
-    uint64  term    = 1;
-    uint64  index   = 2;
-    Command command = 3;
+    uint64        term    = 1;
+    uint64        index   = 2;
+    Command       command = 3;
+    ClusterConfig config  = 4;  // populated when command.type == CMD_CONFIG
 }
 
 // --- RequestVote RPC ---
@@ -61,6 +82,7 @@ message InstallSnapshotRequest {
     uint64 last_included_index = 3;  // snapshot replaces all entries up through this index
     uint64 last_included_term  = 4;  // term of last_included_index
     bytes  data                = 5;  // raw snapshot bytes (entire KV state)
+    ClusterConfig config       = 6;  // cluster configuration at snapshot point
 }
 
 message InstallSnapshotResponse {
