@@ -11,6 +11,9 @@
 
 namespace kv::network {
 
+// Forward declaration — defined in session.hpp.
+class ClusterContext;
+
 // Owns the io_context and TCP acceptor.
 //
 // Usage:
@@ -18,7 +21,12 @@ namespace kv::network {
 //   srv.run();   // blocks until SIGINT/SIGTERM
 class Server {
 public:
+    // Standalone mode (no Raft).
     Server(std::string host, std::uint16_t port, Storage& storage);
+
+    // Cluster mode — pass a ClusterContext for Raft-backed writes.
+    Server(std::string host, std::uint16_t port, Storage& storage,
+           ClusterContext& cluster_ctx);
 
     // Starts the thread pool, begins accepting connections, and installs signal
     // handlers for graceful shutdown (SIGINT / SIGTERM).
@@ -40,6 +48,7 @@ private:
     std::string host_;
     std::uint16_t port_;
     Storage& storage_;
+    ClusterContext* cluster_ctx_ = nullptr;
 
     boost::asio::io_context ioc_;
     boost::asio::ip::tcp::acceptor acceptor_;

@@ -35,6 +35,25 @@ Server::Server(std::string host, std::uint16_t port, Storage& storage)
     spdlog::info("Server listening on {}:{}", host_, port_);
 }
 
+Server::Server(std::string host, std::uint16_t port, Storage& storage,
+               ClusterContext& cluster_ctx)
+    : host_(std::move(host)),
+      port_(port),
+      storage_(storage),
+      cluster_ctx_(&cluster_ctx),
+      ioc_(static_cast<int>(std::thread::hardware_concurrency())),
+      acceptor_(ioc_) {
+    const auto address = boost::asio::ip::make_address(host_);
+    const boost::asio::ip::tcp::endpoint endpoint{address, port_};
+
+    acceptor_.open(endpoint.protocol());
+    acceptor_.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+    acceptor_.bind(endpoint);
+    acceptor_.listen();
+
+    spdlog::info("Server listening on {}:{} (cluster mode)", host_, port_);
+}
+
 void Server::run() {
     // Install SIGINT / SIGTERM handler for graceful shutdown.
     boost::asio::signal_set signals(ioc_, SIGINT, SIGTERM);
@@ -89,7 +108,14 @@ boost::asio::awaitable<void> Server::accept_loop() {
         socket.set_option(boost::asio::ip::tcp::no_delay(true));
 
         // Spawn a detached coroutine for this session.
-        auto session_ptr = std::make_shared<Session>(std::move(socket), storage_);
+        std::shared_ptr<Session> session_ptr;
+        if (cluster_ctx_) {
+            session_ptr = std::make_shared<Session>(
+                std::move(socket), storage_, *cluster_ctx_);
+        } else {
+            session_ptr = std::make_shared<Session>(
+                std::move(socket), storage_);
+        }
         boost::asio::co_spawn(
             ioc_,
             [sp = std::move(session_ptr)]() -> boost::asio::awaitable<void> {

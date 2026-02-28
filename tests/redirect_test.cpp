@@ -46,6 +46,14 @@ public:
         return leader_address_;
     }
 
+    boost::asio::awaitable<bool>
+    submit_write(const std::string& /*key*/, const std::string& /*value*/,
+                 int /*type*/) override {
+        // In redirect tests the leader path writes directly to storage
+        // (standalone-like behavior for simplicity).
+        co_return true;
+    }
+
     // Test controls.
     void set_leader(bool val) { is_leader_ = val; }
     void set_leader_address(std::optional<std::string> addr) {

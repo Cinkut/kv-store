@@ -111,7 +111,7 @@ boost::asio::awaitable<void> Session::run_text(const std::string& remote,
         // Parse.
         auto parse_result = parse_command(line);
 
-        Response response = process_request(parse_result);
+        Response response = co_await process_request(parse_result);
 
         // Serialize and send.
         const std::string wire = serialize_response(response);
@@ -174,7 +174,7 @@ boost::asio::awaitable<void> Session::run_binary(const std::string& remote,
         // Parse the request.
         auto parse_result = parse_binary_request(msg_type, payload);
 
-        Response response = process_request(parse_result);
+        Response response = co_await process_request(parse_result);
 
         // Serialize and send.
         auto wire = serialize_binary_response(response);
@@ -191,57 +191,78 @@ boost::asio::awaitable<void> Session::run_binary(const std::string& remote,
     }
 }
 
-Response Session::process_request(std::variant<Command, ErrorResp>& parse_result) {
+boost::asio::awaitable<Response>
+Session::process_request(std::variant<Command, ErrorResp>& parse_result) {
     if (std::holds_alternative<ErrorResp>(parse_result)) {
-        return std::get<ErrorResp>(parse_result);
+        co_return std::get<ErrorResp>(parse_result);
     }
-    return dispatch(std::get<Command>(parse_result));
+    co_return co_await dispatch(std::get<Command>(parse_result));
 }
 
-Response Session::dispatch(const Command& cmd) {
-    return std::visit(
-        [&](const auto& c) -> Response {
+boost::asio::awaitable<Response> Session::dispatch(const Command& cmd) {
+    co_return co_await std::visit(
+        [&](const auto& c) -> boost::asio::awaitable<Response> {
             using T = std::decay_t<decltype(c)>;
 
             if constexpr (std::is_same_v<T, PingCmd>) {
-                return PongResp{};
+                co_return PongResp{};
 
             } else if constexpr (std::is_same_v<T, GetCmd>) {
                 auto val = storage_.get(c.key);
                 if (!val.has_value()) {
-                    return NotFoundResp{};
+                    co_return NotFoundResp{};
                 }
-                return ValueResp{std::move(*val)};
+                co_return ValueResp{std::move(*val)};
 
             } else if constexpr (std::is_same_v<T, SetCmd>) {
                 // In cluster mode, only the leader processes writes.
                 if (cluster_ctx_ && !cluster_ctx_->is_leader()) {
                     auto addr = cluster_ctx_->leader_address();
                     if (addr) {
-                        return RedirectResp{std::move(*addr)};
+                        co_return RedirectResp{std::move(*addr)};
                     }
-                    return ErrorResp{"no leader available"};
+                    co_return ErrorResp{"no leader available"};
                 }
+                // In cluster mode (leader), submit through Raft.
+                if (cluster_ctx_) {
+                    bool ok = co_await cluster_ctx_->submit_write(c.key, c.value, 1);
+                    if (!ok) {
+                        co_return ErrorResp{"commit failed or timed out"};
+                    }
+                    co_return OkResp{};
+                }
+                // Standalone mode — write directly.
                 storage_.set(c.key, c.value);
-                return OkResp{};
+                co_return OkResp{};
 
             } else if constexpr (std::is_same_v<T, DelCmd>) {
                 // In cluster mode, only the leader processes writes.
                 if (cluster_ctx_ && !cluster_ctx_->is_leader()) {
                     auto addr = cluster_ctx_->leader_address();
                     if (addr) {
-                        return RedirectResp{std::move(*addr)};
+                        co_return RedirectResp{std::move(*addr)};
                     }
-                    return ErrorResp{"no leader available"};
+                    co_return ErrorResp{"no leader available"};
                 }
+                // In cluster mode (leader), submit through Raft.
+                if (cluster_ctx_) {
+                    bool ok = co_await cluster_ctx_->submit_write(c.key, "", 2);
+                    if (!ok) {
+                        co_return ErrorResp{"commit failed or timed out"};
+                    }
+                    // For DEL via Raft, we always return DELETED (the entry was committed).
+                    // The actual key existence check happens at apply time.
+                    co_return DeletedResp{};
+                }
+                // Standalone mode — delete directly.
                 const bool removed = storage_.del(c.key);
                 if (!removed) {
-                    return NotFoundResp{};
+                    co_return NotFoundResp{};
                 }
-                return DeletedResp{};
+                co_return DeletedResp{};
 
             } else if constexpr (std::is_same_v<T, KeysCmd>) {
-                return KeysResp{storage_.keys()};
+                co_return KeysResp{storage_.keys()};
             }
         },
         cmd);

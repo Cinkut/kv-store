@@ -25,6 +25,14 @@ public:
     // Returns the "host:port" client address of the current leader,
     // or nullopt if the leader is unknown.
     [[nodiscard]] virtual std::optional<std::string> leader_address() const = 0;
+
+    // Submit a write command to the Raft cluster and wait for it to be committed.
+    // Returns true if the command was committed successfully.
+    // Returns false on timeout, leadership loss, or if this node is not the leader.
+    //
+    // `type` is 1 for SET, 2 for DEL (matching protobuf CommandType enum).
+    [[nodiscard]] virtual boost::asio::awaitable<bool>
+    submit_write(const std::string& key, const std::string& value, int type) = 0;
 };
 
 // Handles one TCP connection for its lifetime.
@@ -51,11 +59,12 @@ public:
 
 private:
     // Execute a parsed Command against storage and return the appropriate Response.
-    [[nodiscard]] Response dispatch(const Command& cmd);
+    [[nodiscard]] boost::asio::awaitable<Response> dispatch(const Command& cmd);
 
     // Process a single parsed request and send the response.
     // Shared between text and binary loops.
-    [[nodiscard]] Response process_request(std::variant<Command, ErrorResp>& parse_result);
+    [[nodiscard]] boost::asio::awaitable<Response>
+    process_request(std::variant<Command, ErrorResp>& parse_result);
 
     // Text protocol loop: reads newline-delimited commands.
     // `seed` contains any bytes already read that must be prepended to the buffer.

@@ -1,4 +1,5 @@
 #include "raft/commit_awaiter.hpp"
+#include "raft/raft_cluster_context.hpp"
 #include "raft/raft_log.hpp"
 #include "raft/raft_node.hpp"
 #include "raft/state_machine.hpp"
@@ -2396,4 +2397,187 @@ TEST_F(CommitAwaiterTest, DuplicateWaitSameIndex) {
     pump(ioc_);
     EXPECT_TRUE(result1);
     EXPECT_EQ(awaiter.pending_count(), 0u);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  RaftClusterContext tests
+// ════════════════════════════════════════════════════════════════════════════
+
+class RaftClusterContextTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        spdlog::drop("kv");
+        spdlog::drop("node-1");
+        kv::init_default_logger();
+        logger_ = kv::make_node_logger(1, spdlog::level::debug);
+    }
+
+    // Create a RaftNode, make it leader, and return it.
+    // Uses DeterministicTimer and MockTransport from the anonymous namespace.
+    struct NodeBundle {
+        std::unique_ptr<MockTransport> transport;
+        std::unique_ptr<DeterministicTimerFactory> timer_factory;
+        std::unique_ptr<RaftNode> node;
+
+        DeterministicTimer* election_timer() { return timer_factory->timer(0); }
+        DeterministicTimer* heartbeat_timer() { return timer_factory->timer(1); }
+    };
+
+    NodeBundle make_leader(boost::asio::io_context& ioc,
+                           RaftNode::ApplyCallback on_apply = {}) {
+        auto transport = std::make_unique<MockTransport>();
+        auto timer_factory = std::make_unique<DeterministicTimerFactory>();
+
+        auto node = std::make_unique<RaftNode>(
+            ioc, 1, std::vector<uint32_t>{2, 3},
+            *transport, *timer_factory, logger_,
+            std::move(on_apply));
+
+        node->start();
+        pump(ioc);
+
+        // Fire election timer to trigger election.
+        timer_factory->timer(0)->fire();
+        pump(ioc);
+
+        // Simulate both peers voting yes.
+        for (const auto* msg : transport->find_request_vote()) {
+            RequestVoteResponse resp;
+            resp.set_term(node->current_term());
+            resp.set_vote_granted(true);
+            node->handle_vote_response(msg->peer_id, resp);
+        }
+        pump(ioc);
+
+        assert(node->state() == kv::NodeState::Leader);
+        transport->clear_sent();
+
+        return {std::move(transport), std::move(timer_factory), std::move(node)};
+    }
+
+    std::shared_ptr<spdlog::logger> logger_;
+};
+
+TEST_F(RaftClusterContextTest, IsLeaderAndAddress) {
+    boost::asio::io_context ioc;
+    auto bundle = make_leader(ioc);
+    kv::raft::CommitAwaiter awaiter(ioc, logger_);
+
+    std::map<uint32_t, std::string> addrs = {
+        {1, "localhost:6001"}, {2, "localhost:6002"}, {3, "localhost:6003"}
+    };
+    kv::raft::RaftClusterContext ctx(*bundle.node, awaiter, addrs, logger_);
+
+    EXPECT_TRUE(ctx.is_leader());
+    // leader_id() on a Leader node points to self (node_id=1).
+    auto addr = ctx.leader_address();
+    EXPECT_TRUE(addr.has_value());
+    EXPECT_EQ(*addr, "localhost:6001");
+
+    bundle.node->stop();
+    pump(ioc);
+}
+
+TEST_F(RaftClusterContextTest, SubmitWriteSuccess) {
+    boost::asio::io_context ioc;
+
+    // Set up apply callback that notifies CommitAwaiter.
+    kv::raft::CommitAwaiter awaiter(ioc, logger_);
+    auto on_apply = [&](const LogEntry& entry) {
+        awaiter.notify_commit(entry.index());
+    };
+
+    auto bundle = make_leader(ioc, on_apply);
+
+    std::map<uint32_t, std::string> addrs = {
+        {1, "localhost:6001"}, {2, "localhost:6002"}, {3, "localhost:6003"}
+    };
+    kv::raft::RaftClusterContext ctx(*bundle.node, awaiter, addrs, logger_);
+
+    bool result = false;
+    boost::asio::co_spawn(ioc, [&]() -> boost::asio::awaitable<void> {
+        result = co_await ctx.submit_write("mykey", "myval", 1); // CMD_SET
+    }, boost::asio::detached);
+
+    pump(ioc);
+    // Entry submitted, waiter pending.
+    EXPECT_EQ(awaiter.pending_count(), 1u);
+
+    // Simulate peer ACKs for the AppendEntries containing this entry.
+    // The leader needs majority (2 out of 3). Leader already counts itself.
+    // Need 1 more ACK.
+    auto ae_msgs = bundle.transport->find_append_entries();
+    ASSERT_FALSE(ae_msgs.empty());
+
+    for (const auto* msg : ae_msgs) {
+        AppendEntriesResponse resp;
+        resp.set_term(bundle.node->current_term());
+        resp.set_success(true);
+        resp.set_match_index(bundle.node->log().last_index());
+        bundle.node->handle_append_entries_response(msg->peer_id, resp);
+        break; // Only need one ACK for majority.
+    }
+    pump(ioc);
+
+    EXPECT_TRUE(result);
+    EXPECT_EQ(awaiter.pending_count(), 0u);
+
+    bundle.node->stop();
+    pump(ioc);
+}
+
+TEST_F(RaftClusterContextTest, SubmitWriteOnFollowerFails) {
+    boost::asio::io_context ioc;
+    MockTransport transport;
+    DeterministicTimerFactory timer_factory;
+    kv::raft::CommitAwaiter awaiter(ioc, logger_);
+
+    // Create a follower node (never trigger election).
+    RaftNode node(ioc, 1, {2, 3}, transport, timer_factory, logger_);
+    node.start();
+    pump(ioc);
+
+    ASSERT_EQ(node.state(), kv::NodeState::Follower);
+
+    std::map<uint32_t, std::string> addrs = {{1, "localhost:6001"}};
+    kv::raft::RaftClusterContext ctx(node, awaiter, addrs, logger_);
+
+    bool result = true;
+    boost::asio::co_spawn(ioc, [&]() -> boost::asio::awaitable<void> {
+        result = co_await ctx.submit_write("k", "v", 1);
+    }, boost::asio::detached);
+
+    pump(ioc);
+    EXPECT_FALSE(result);
+
+    node.stop();
+    pump(ioc);
+}
+
+TEST_F(RaftClusterContextTest, FailAllOnLeadershipLoss) {
+    boost::asio::io_context ioc;
+    kv::raft::CommitAwaiter awaiter(ioc, logger_);
+
+    auto bundle = make_leader(ioc);
+
+    std::map<uint32_t, std::string> addrs = {{1, "localhost:6001"}};
+    kv::raft::RaftClusterContext ctx(*bundle.node, awaiter, addrs, logger_);
+
+    bool result = true;
+    boost::asio::co_spawn(ioc, [&]() -> boost::asio::awaitable<void> {
+        result = co_await ctx.submit_write("k", "v", 1);
+    }, boost::asio::detached);
+
+    pump(ioc);
+    EXPECT_EQ(awaiter.pending_count(), 1u);
+
+    // Simulate leadership loss by calling fail_all.
+    awaiter.fail_all();
+    pump(ioc);
+
+    EXPECT_FALSE(result);
+    EXPECT_EQ(awaiter.pending_count(), 0u);
+
+    bundle.node->stop();
+    pump(ioc);
 }
