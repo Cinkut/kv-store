@@ -16,6 +16,7 @@ add_executable(kvstore_tests
     snapshot_io_impl_test.cpp
     cluster_integration_test.cpp
     resp_protocol_test.cpp
+    cluster_config_test.cpp
 )
 target_link_libraries(kvstore_tests
     PRIVATE
