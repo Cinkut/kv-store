@@ -12,6 +12,7 @@ add_executable(kvstore_tests
     binary_protocol_test.cpp
     real_timer_test.cpp
     raft_transport_test.cpp
+    snapshot_io_impl_test.cpp
 )
 target_link_libraries(kvstore_tests
     PRIVATE
