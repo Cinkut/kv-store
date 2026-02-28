@@ -42,6 +42,8 @@ class MockClusterContext : public kv::network::ClusterContext {
 public:
     bool is_leader() const noexcept override { return is_leader_; }
 
+    bool has_read_lease() const noexcept override { return has_read_lease_; }
+
     std::optional<std::string> leader_address() const override {
         return leader_address_;
     }
@@ -59,9 +61,11 @@ public:
     void set_leader_address(std::optional<std::string> addr) {
         leader_address_ = std::move(addr);
     }
+    void set_read_lease(bool val) { has_read_lease_ = val; }
 
 private:
     bool is_leader_ = false;
+    bool has_read_lease_ = true;  // default true for existing tests
     std::optional<std::string> leader_address_;
 };
 
@@ -213,14 +217,14 @@ TEST_F(RedirectTest, FollowerDelRedirects) {
     EXPECT_EQ(cmd(sock, "DEL k"), "REDIRECT 10.0.0.1:6001");
 }
 
-TEST_F(RedirectTest, FollowerGetStillWorks) {
-    // GET is a read — followers serve reads directly (no redirect).
+TEST_F(RedirectTest, FollowerGetRedirects) {
+    // GET is now cluster-aware — followers redirect to leader.
     MockClusterContext ctx;
     ctx.set_leader(false);
     ctx.set_leader_address("10.0.0.1:6001");
     start_session(&ctx);
     auto sock = connect_client();
-    EXPECT_EQ(cmd(sock, "GET missing"), "NOT_FOUND");
+    EXPECT_EQ(cmd(sock, "GET missing"), "REDIRECT 10.0.0.1:6001");
 }
 
 TEST_F(RedirectTest, FollowerPingStillWorks) {
@@ -231,12 +235,14 @@ TEST_F(RedirectTest, FollowerPingStillWorks) {
     EXPECT_EQ(cmd(sock, "PING"), "PONG");
 }
 
-TEST_F(RedirectTest, FollowerKeysStillWorks) {
+TEST_F(RedirectTest, FollowerKeysRedirects) {
+    // KEYS is now cluster-aware — followers redirect to leader.
     MockClusterContext ctx;
     ctx.set_leader(false);
+    ctx.set_leader_address("10.0.0.1:6001");
     start_session(&ctx);
     auto sock = connect_client();
-    EXPECT_EQ(cmd(sock, "KEYS"), "KEYS");
+    EXPECT_EQ(cmd(sock, "KEYS"), "REDIRECT 10.0.0.1:6001");
 }
 
 // ── Tests: follower mode with unknown leader ─────────────────────────────────
@@ -263,6 +269,74 @@ TEST_F(RedirectTest, FollowerNoLeaderDelReturnsError) {
     auto resp = cmd(sock, "DEL k");
     EXPECT_TRUE(resp.rfind("ERROR", 0) == 0);
     EXPECT_NE(resp.find("no leader"), std::string::npos);
+}
+
+TEST_F(RedirectTest, FollowerNoLeaderGetReturnsError) {
+    MockClusterContext ctx;
+    ctx.set_leader(false);
+    ctx.set_leader_address(std::nullopt);
+    start_session(&ctx);
+    auto sock = connect_client();
+
+    auto resp = cmd(sock, "GET k");
+    EXPECT_TRUE(resp.rfind("ERROR", 0) == 0);
+    EXPECT_NE(resp.find("no leader"), std::string::npos);
+}
+
+TEST_F(RedirectTest, FollowerNoLeaderKeysReturnsError) {
+    MockClusterContext ctx;
+    ctx.set_leader(false);
+    ctx.set_leader_address(std::nullopt);
+    start_session(&ctx);
+    auto sock = connect_client();
+
+    auto resp = cmd(sock, "KEYS");
+    EXPECT_TRUE(resp.rfind("ERROR", 0) == 0);
+    EXPECT_NE(resp.find("no leader"), std::string::npos);
+}
+
+// ── Tests: leader without read lease ────────────────────────────────────────
+
+TEST_F(RedirectTest, LeaderNoLeaseGetReturnsError) {
+    MockClusterContext ctx;
+    ctx.set_leader(true);
+    ctx.set_read_lease(false);
+    start_session(&ctx);
+    auto sock = connect_client();
+
+    auto resp = cmd(sock, "GET k");
+    EXPECT_TRUE(resp.rfind("ERROR", 0) == 0);
+    EXPECT_NE(resp.find("no read lease"), std::string::npos);
+}
+
+TEST_F(RedirectTest, LeaderNoLeaseKeysReturnsError) {
+    MockClusterContext ctx;
+    ctx.set_leader(true);
+    ctx.set_read_lease(false);
+    start_session(&ctx);
+    auto sock = connect_client();
+
+    auto resp = cmd(sock, "KEYS");
+    EXPECT_TRUE(resp.rfind("ERROR", 0) == 0);
+    EXPECT_NE(resp.find("no read lease"), std::string::npos);
+}
+
+TEST_F(RedirectTest, LeaderWithLeaseGetSucceeds) {
+    MockClusterContext ctx;
+    ctx.set_leader(true);
+    ctx.set_read_lease(true);
+    start_session(&ctx);
+    auto sock = connect_client();
+    EXPECT_EQ(cmd(sock, "GET missing"), "NOT_FOUND");
+}
+
+TEST_F(RedirectTest, LeaderWithLeaseKeysSucceeds) {
+    MockClusterContext ctx;
+    ctx.set_leader(true);
+    ctx.set_read_lease(true);
+    start_session(&ctx);
+    auto sock = connect_client();
+    EXPECT_EQ(cmd(sock, "KEYS"), "KEYS");
 }
 
 } // anonymous namespace

@@ -22,6 +22,11 @@ public:
     // Returns true if this node is the Raft leader (or if running standalone).
     [[nodiscard]] virtual bool is_leader() const noexcept = 0;
 
+    // Returns true if this node holds a valid read lease — meaning it can
+    // serve GET/KEYS locally with linearizability guarantees.
+    // Always returns true in standalone mode (no cluster).
+    [[nodiscard]] virtual bool has_read_lease() const noexcept = 0;
+
     // Returns the "host:port" client address of the current leader,
     // or nullopt if the leader is unknown.
     [[nodiscard]] virtual std::optional<std::string> leader_address() const = 0;

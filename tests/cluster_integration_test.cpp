@@ -303,13 +303,24 @@ TEST_F(ClusterIntegrationTest, ReadAfterWrite) {
     SyncClient leader(leader_port());
     EXPECT_EQ(leader.cmd("SET read_key read_value"), "OK");
 
-    // Give a moment for replication.
-    std::this_thread::sleep_for(std::chrono::milliseconds{200});
+    // Read from leader — only the leader with a valid read lease can serve reads.
+    EXPECT_EQ(leader.cmd("GET read_key"), "VALUE read_value");
+}
 
-    // Read from a follower — reads should work on any node since they
-    // read from local storage (which is updated by StateMachine::apply).
+TEST_F(ClusterIntegrationTest, FollowerRedirectsGet) {
+    // Followers now redirect GET requests to the leader.
     SyncClient follower(follower_port());
-    EXPECT_EQ(follower.cmd("GET read_key"), "VALUE read_value");
+    auto resp = follower.cmd("GET any_key");
+    EXPECT_TRUE(resp.rfind("REDIRECT ", 0) == 0)
+        << "Expected REDIRECT for GET on follower, got: " << resp;
+}
+
+TEST_F(ClusterIntegrationTest, FollowerRedirectsKeys) {
+    // Followers now redirect KEYS requests to the leader.
+    SyncClient follower(follower_port());
+    auto resp = follower.cmd("KEYS");
+    EXPECT_TRUE(resp.rfind("REDIRECT ", 0) == 0)
+        << "Expected REDIRECT for KEYS on follower, got: " << resp;
 }
 
 TEST_F(ClusterIntegrationTest, MultipleWritesAndKeys) {
@@ -329,12 +340,8 @@ TEST_F(ClusterIntegrationTest, DeleteThroughLeader) {
     EXPECT_EQ(leader.cmd("GET del_key"), "VALUE del_val");
     EXPECT_EQ(leader.cmd("DEL del_key"), "DELETED");
 
-    // Give a moment for replication.
-    std::this_thread::sleep_for(std::chrono::milliseconds{200});
-
-    // Verify deletion propagated.
-    SyncClient follower(follower_port());
-    EXPECT_EQ(follower.cmd("GET del_key"), "NOT_FOUND");
+    // Verify deletion on leader.
+    EXPECT_EQ(leader.cmd("GET del_key"), "NOT_FOUND");
 }
 
 TEST_F(ClusterIntegrationTest, OverwriteThroughLeader) {
@@ -344,19 +351,12 @@ TEST_F(ClusterIntegrationTest, OverwriteThroughLeader) {
     EXPECT_EQ(leader.cmd("GET ow_key"), "VALUE updated");
 }
 
-TEST_F(ClusterIntegrationTest, FollowerReadsAreConsistent) {
+TEST_F(ClusterIntegrationTest, LeaderReadsAreConsistent) {
     SyncClient leader(leader_port());
     EXPECT_EQ(leader.cmd("SET consistent_key consistent_val"), "OK");
 
-    // Wait for replication.
-    std::this_thread::sleep_for(std::chrono::milliseconds{200});
-
-    // All nodes should return the same value.
-    for (int i = 0; i < 3; ++i) {
-        SyncClient client(kNodes[i].client_port);
-        EXPECT_EQ(client.cmd("GET consistent_key"), "VALUE consistent_val")
-            << "Inconsistent read on node " << (i + 1);
-    }
+    // Leader should serve reads with its read lease.
+    EXPECT_EQ(leader.cmd("GET consistent_key"), "VALUE consistent_val");
 }
 
 } // anonymous namespace

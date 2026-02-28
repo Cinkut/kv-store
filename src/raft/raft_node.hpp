@@ -17,6 +17,7 @@
 #include <spdlog/spdlog.h>
 
 #include "common/logger.hpp"
+#include "raft/clock.hpp"
 #include "raft/raft_log.hpp"
 #include "raft.pb.h"
 
@@ -144,6 +145,7 @@ public:
     //   snapshot_io  – snapshot persistence (optional; null disables snapshot)
     //   snapshot_interval – entries applied between snapshots (0 = no auto-snapshot)
     //   persist_cb   – WAL persistence callback (optional; null disables WAL writes)
+    //   clock        – time source for read leases (optional; null uses SteadyClock)
     RaftNode(boost::asio::io_context& ioc,
              uint32_t node_id,
              std::vector<uint32_t> peer_ids,
@@ -153,7 +155,8 @@ public:
              ApplyCallback on_apply = {},
              SnapshotIO* snapshot_io = nullptr,
              uint64_t snapshot_interval = 0,
-             PersistCallback* persist_cb = nullptr);
+             PersistCallback* persist_cb = nullptr,
+             Clock* clock = nullptr);
 
     ~RaftNode() = default;
 
@@ -236,6 +239,12 @@ public:
     [[nodiscard]] uint64_t snapshot_last_index() const noexcept { return snapshot_last_included_index_; }
     [[nodiscard]] uint64_t snapshot_last_term() const noexcept { return snapshot_last_included_term_; }
 
+    // Read lease query.
+    // Returns true if this node is the Leader AND holds a valid lease,
+    // meaning a majority of peers acknowledged heartbeats recently enough
+    // that no new election could have started.
+    [[nodiscard]] bool has_read_lease() const noexcept;
+
     // ── Strand accessor (for external dispatch) ──────────────────────────────
     [[nodiscard]] boost::asio::strand<boost::asio::io_context::executor_type>&
     strand() noexcept { return strand_; }
@@ -282,6 +291,11 @@ private:
 
     // Check if we should create a snapshot and do so if needed.
     void maybe_trigger_snapshot();
+
+    // ── Read lease ───────────────────────────────────────────────────────────
+
+    // Check if a majority of peers have acked recently enough to hold a lease.
+    void try_renew_lease();
 
     // ── Helper ───────────────────────────────────────────────────────────────
 
@@ -341,6 +355,20 @@ private:
 
     // Shutdown flag.
     bool stopped_ = false;
+
+    // ── Read lease state ─────────────────────────────────────────────────────
+
+    static constexpr auto kMaxClockDrift = std::chrono::milliseconds{5};
+    // Lease must expire before any follower can win an election.
+    // kElectionTimeoutMin - 2 * kMaxClockDrift = 150ms - 10ms = 140ms.
+    static constexpr auto kLeaseDuration =
+        kElectionTimeoutMin - 2 * kMaxClockDrift;
+
+    Clock* clock_ = nullptr;                        // injected; null → default_clock_
+    SteadyClock default_clock_;                      // fallback when no clock injected
+    std::map<uint32_t, Clock::time_point> last_ack_time_;  // peer → last successful AE ack
+    Clock::time_point lease_start_{};
+    bool lease_valid_ = false;
 };
 
 } // namespace kv::raft

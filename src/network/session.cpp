@@ -255,6 +255,19 @@ boost::asio::awaitable<Response> Session::dispatch(const Command& cmd) {
                 co_return PongResp{};
 
             } else if constexpr (std::is_same_v<T, GetCmd>) {
+                // In cluster mode, only the leader with a valid lease serves reads.
+                if (cluster_ctx_) {
+                    if (!cluster_ctx_->is_leader()) {
+                        auto addr = cluster_ctx_->leader_address();
+                        if (addr) {
+                            co_return RedirectResp{std::move(*addr)};
+                        }
+                        co_return ErrorResp{"no leader available"};
+                    }
+                    if (!cluster_ctx_->has_read_lease()) {
+                        co_return ErrorResp{"no read lease"};
+                    }
+                }
                 auto val = storage_.get(c.key);
                 if (!val.has_value()) {
                     co_return NotFoundResp{};
@@ -309,6 +322,19 @@ boost::asio::awaitable<Response> Session::dispatch(const Command& cmd) {
                 co_return DeletedResp{};
 
             } else if constexpr (std::is_same_v<T, KeysCmd>) {
+                // In cluster mode, only the leader with a valid lease serves reads.
+                if (cluster_ctx_) {
+                    if (!cluster_ctx_->is_leader()) {
+                        auto addr = cluster_ctx_->leader_address();
+                        if (addr) {
+                            co_return RedirectResp{std::move(*addr)};
+                        }
+                        co_return ErrorResp{"no leader available"};
+                    }
+                    if (!cluster_ctx_->has_read_lease()) {
+                        co_return ErrorResp{"no read lease"};
+                    }
+                }
                 co_return KeysResp{storage_.keys()};
             }
         },

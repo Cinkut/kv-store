@@ -21,7 +21,8 @@ RaftNode::RaftNode(asio::io_context& ioc,
                    ApplyCallback on_apply,
                    SnapshotIO* snapshot_io,
                    uint64_t snapshot_interval,
-                   PersistCallback* persist_cb)
+                   PersistCallback* persist_cb,
+                   Clock* clock)
     : strand_(asio::make_strand(ioc))
     , node_id_(node_id)
     , peer_ids_(std::move(peer_ids))
@@ -32,6 +33,7 @@ RaftNode::RaftNode(asio::io_context& ioc,
     , snapshot_io_(snapshot_io)
     , snapshot_interval_(snapshot_interval)
     , persist_cb_(persist_cb)
+    , clock_(clock ? clock : &default_clock_)
 {
 }
 
@@ -269,11 +271,17 @@ void RaftNode::handle_append_entries_response(uint32_t from_peer,
         match_index_[from_peer] = resp.match_index();
         next_index_[from_peer] = resp.match_index() + 1;
 
+        // Record ack time for read lease tracking.
+        last_ack_time_[from_peer] = clock_->now();
+
         logger_->debug("[term={}] AE success from node {} (matchIndex={})",
                        current_term_, from_peer, resp.match_index());
 
         // Try to advance the commit index based on new matchIndex.
         try_advance_commit();
+
+        // Try to renew the read lease based on recent acks.
+        try_renew_lease();
     } else {
         // Decrement nextIndex and retry (Raft §5.3).
         if (next_index_[from_peer] > 1) {
@@ -472,6 +480,10 @@ void RaftNode::become_follower(uint64_t term) {
     voted_for_ = std::nullopt;
     leader_id_ = std::nullopt;
 
+    // Invalidate read lease.
+    lease_valid_ = false;
+    last_ack_time_.clear();
+
     if (prev != NodeState::Follower) {
         logger_->info("[term={}] Stepped down to Follower (was {})",
                       current_term_,
@@ -501,6 +513,10 @@ void RaftNode::become_leader() {
         next_index_[peer] = log_.last_index() + 1;
         match_index_[peer] = 0;
     }
+
+    // Reset read lease state — lease must be earned via heartbeat acks.
+    last_ack_time_.clear();
+    lease_valid_ = false;
 
     // Append a no-op entry for this term (Raft §8).
     Command noop;
@@ -777,6 +793,48 @@ void RaftNode::reset_election_timer() {
     if (election_timer_) {
         election_timer_->expires_after(random_election_timeout());
     }
+}
+
+// ── Read lease ──────────────────────────────────────────────────────────────
+
+void RaftNode::try_renew_lease() {
+    if (state_ != NodeState::Leader) return;
+
+    auto now = clock_->now();
+
+    // Count peers whose last ack is within the lease window.
+    int recent_acks = 1;  // self always counts
+    for (uint32_t peer : peer_ids_) {
+        auto it = last_ack_time_.find(peer);
+        if (it != last_ack_time_.end() &&
+            (now - it->second) <= kLeaseDuration) {
+            ++recent_acks;
+        }
+    }
+
+    int cluster_size = static_cast<int>(peer_ids_.size()) + 1;
+    if (recent_acks > cluster_size / 2) {
+        if (!lease_valid_) {
+            logger_->debug("[term={}] Read lease acquired ({}/{})",
+                           current_term_, recent_acks, cluster_size);
+        }
+        lease_start_ = now;
+        lease_valid_ = true;
+    } else {
+        if (lease_valid_) {
+            logger_->debug("[term={}] Read lease lost ({}/{})",
+                           current_term_, recent_acks, cluster_size);
+        }
+        lease_valid_ = false;
+    }
+}
+
+bool RaftNode::has_read_lease() const noexcept {
+    if (state_ != NodeState::Leader || !lease_valid_) return false;
+
+    // Check that the lease hasn't expired since it was last renewed.
+    auto now = clock_->now();
+    return (now - lease_start_) <= kLeaseDuration;
 }
 
 } // namespace kv::raft

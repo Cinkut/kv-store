@@ -1,3 +1,4 @@
+#include "raft/clock.hpp"
 #include "raft/commit_awaiter.hpp"
 #include "raft/raft_cluster_context.hpp"
 #include "raft/raft_log.hpp"
@@ -2686,4 +2687,324 @@ TEST_F(RaftNodeTest, RestoreThenStartWorksNormally) {
 
     node.stop();
     pump(ioc_);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Read Lease tests (Etap 7.2)
+// ════════════════════════════════════════════════════════════════════════════
+
+class ReadLeaseTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        spdlog::drop("kv");
+        kv::init_default_logger(spdlog::level::debug);
+        logger_ = kv::make_node_logger(1, spdlog::level::debug);
+    }
+
+    // Elect node 1 as leader (3-node cluster), with a MockClock injected.
+    // Returns transport, timer_factory, node — node is already leader.
+    struct LeaderBundle {
+        std::unique_ptr<MockTransport> transport;
+        std::unique_ptr<DeterministicTimerFactory> timer_factory;
+        std::unique_ptr<RaftNode> node;
+
+        DeterministicTimer* election_timer() { return timer_factory->timer(0); }
+        DeterministicTimer* heartbeat_timer() { return timer_factory->timer(1); }
+    };
+
+    LeaderBundle make_leader_with_clock(boost::asio::io_context& ioc, MockClock& clock) {
+        auto transport = std::make_unique<MockTransport>();
+        auto timer_factory = std::make_unique<DeterministicTimerFactory>();
+
+        auto node = std::make_unique<RaftNode>(
+            ioc, 1, std::vector<uint32_t>{2, 3},
+            *transport, *timer_factory, logger_,
+            RaftNode::ApplyCallback{}, nullptr, 0, nullptr, &clock);
+
+        node->start();
+        pump(ioc);
+
+        // Fire election timer to trigger election.
+        timer_factory->timer(0)->fire();
+        pump(ioc);
+
+        // Simulate both peers voting yes.
+        for (const auto* msg : transport->find_request_vote()) {
+            RequestVoteResponse resp;
+            resp.set_term(node->current_term());
+            resp.set_vote_granted(true);
+            node->handle_vote_response(msg->peer_id, resp);
+        }
+        pump(ioc);
+
+        assert(node->state() == kv::NodeState::Leader);
+        transport->clear_sent();
+
+        return {std::move(transport), std::move(timer_factory), std::move(node)};
+    }
+
+    // Deliver a successful AE response from a peer.
+    void ack_append_entries(RaftNode& node, uint32_t from_peer) {
+        AppendEntriesResponse resp;
+        resp.set_term(node.current_term());
+        resp.set_success(true);
+        resp.set_match_index(node.log().last_index());
+        node.handle_append_entries_response(from_peer, resp);
+    }
+
+    std::shared_ptr<spdlog::logger> logger_;
+};
+
+TEST_F(ReadLeaseTest, NewLeaderHasNoLease) {
+    boost::asio::io_context ioc;
+    MockClock clock;
+    auto bundle = make_leader_with_clock(ioc, clock);
+
+    // Fresh leader hasn't received any heartbeat acks yet.
+    EXPECT_FALSE(bundle.node->has_read_lease());
+
+    bundle.node->stop();
+    pump(ioc);
+}
+
+TEST_F(ReadLeaseTest, LeaseAcquiredAfterMajorityAck) {
+    boost::asio::io_context ioc;
+    MockClock clock;
+    auto bundle = make_leader_with_clock(ioc, clock);
+
+    // Advance clock a bit, then deliver AE ack from one peer.
+    clock.advance(std::chrono::milliseconds{10});
+    ack_append_entries(*bundle.node, 2);
+    pump(ioc);
+
+    // One peer ack + self = 2/3 = majority → lease acquired.
+    EXPECT_TRUE(bundle.node->has_read_lease());
+
+    bundle.node->stop();
+    pump(ioc);
+}
+
+TEST_F(ReadLeaseTest, SinglePeerAckNotEnoughForFiveNodeCluster) {
+    boost::asio::io_context ioc;
+    MockClock clock;
+    MockTransport transport;
+    DeterministicTimerFactory timer_factory;
+
+    // 5-node cluster: node 1 + peers {2, 3, 4, 5}.
+    RaftNode node(ioc, 1, {2, 3, 4, 5}, transport, timer_factory, logger_,
+                  {}, nullptr, 0, nullptr, &clock);
+    node.start();
+    pump(ioc);
+
+    // Elect as leader.
+    timer_factory.timer(0)->fire();
+    pump(ioc);
+    for (const auto* msg : transport.find_request_vote()) {
+        RequestVoteResponse resp;
+        resp.set_term(node.current_term());
+        resp.set_vote_granted(true);
+        node.handle_vote_response(msg->peer_id, resp);
+    }
+    pump(ioc);
+    ASSERT_EQ(node.state(), kv::NodeState::Leader);
+    transport.clear_sent();
+
+    // Ack from only 1 peer: self + 1 = 2/5, not majority.
+    clock.advance(std::chrono::milliseconds{10});
+    ack_append_entries(node, 2);
+    pump(ioc);
+    EXPECT_FALSE(node.has_read_lease());
+
+    // Ack from 2nd peer: self + 2 = 3/5 = majority → lease acquired.
+    ack_append_entries(node, 3);
+    pump(ioc);
+    EXPECT_TRUE(node.has_read_lease());
+
+    node.stop();
+    pump(ioc);
+}
+
+TEST_F(ReadLeaseTest, LeaseExpiresAfterDuration) {
+    boost::asio::io_context ioc;
+    MockClock clock;
+    auto bundle = make_leader_with_clock(ioc, clock);
+
+    // Get a lease.
+    clock.advance(std::chrono::milliseconds{10});
+    ack_append_entries(*bundle.node, 2);
+    pump(ioc);
+    ASSERT_TRUE(bundle.node->has_read_lease());
+
+    // Advance clock beyond lease duration (140ms).
+    clock.advance(std::chrono::milliseconds{141});
+
+    // Lease should now be expired (no more acks since then).
+    EXPECT_FALSE(bundle.node->has_read_lease());
+
+    bundle.node->stop();
+    pump(ioc);
+}
+
+TEST_F(ReadLeaseTest, LeaseRenewedBySubsequentAcks) {
+    boost::asio::io_context ioc;
+    MockClock clock;
+    auto bundle = make_leader_with_clock(ioc, clock);
+
+    // Get initial lease.
+    clock.advance(std::chrono::milliseconds{10});
+    ack_append_entries(*bundle.node, 2);
+    pump(ioc);
+    ASSERT_TRUE(bundle.node->has_read_lease());
+
+    // Advance 100ms (within 140ms window), renew with another ack.
+    clock.advance(std::chrono::milliseconds{100});
+    ack_append_entries(*bundle.node, 2);
+    pump(ioc);
+    EXPECT_TRUE(bundle.node->has_read_lease());
+
+    // Advance another 100ms (200ms since first ack, but only 100ms since renewal).
+    clock.advance(std::chrono::milliseconds{100});
+    EXPECT_TRUE(bundle.node->has_read_lease());
+
+    // Advance another 50ms (150ms since last renewal > 140ms lease).
+    clock.advance(std::chrono::milliseconds{50});
+    EXPECT_FALSE(bundle.node->has_read_lease());
+
+    bundle.node->stop();
+    pump(ioc);
+}
+
+TEST_F(ReadLeaseTest, LeaseInvalidatedOnStepDown) {
+    boost::asio::io_context ioc;
+    MockClock clock;
+    auto bundle = make_leader_with_clock(ioc, clock);
+
+    // Get a lease.
+    clock.advance(std::chrono::milliseconds{10});
+    ack_append_entries(*bundle.node, 2);
+    pump(ioc);
+    ASSERT_TRUE(bundle.node->has_read_lease());
+
+    // Receive AE response with higher term → step down to follower.
+    AppendEntriesResponse resp;
+    resp.set_term(bundle.node->current_term() + 1);
+    resp.set_success(false);
+    resp.set_match_index(0);
+    bundle.node->handle_append_entries_response(2, resp);
+    pump(ioc);
+
+    EXPECT_EQ(bundle.node->state(), kv::NodeState::Follower);
+    EXPECT_FALSE(bundle.node->has_read_lease());
+
+    bundle.node->stop();
+    pump(ioc);
+}
+
+TEST_F(ReadLeaseTest, FollowerNeverHasLease) {
+    boost::asio::io_context ioc;
+    MockClock clock;
+    MockTransport transport;
+    DeterministicTimerFactory timer_factory;
+
+    RaftNode node(ioc, 1, {2, 3}, transport, timer_factory, logger_,
+                  {}, nullptr, 0, nullptr, &clock);
+    node.start();
+    pump(ioc);
+
+    // Node starts as follower — no lease.
+    EXPECT_EQ(node.state(), kv::NodeState::Follower);
+    EXPECT_FALSE(node.has_read_lease());
+
+    node.stop();
+    pump(ioc);
+}
+
+TEST_F(ReadLeaseTest, LeaseStaleAcksExpire) {
+    boost::asio::io_context ioc;
+    MockClock clock;
+    auto bundle = make_leader_with_clock(ioc, clock);
+
+    // Get lease from peer 2.
+    clock.advance(std::chrono::milliseconds{10});
+    ack_append_entries(*bundle.node, 2);
+    pump(ioc);
+    ASSERT_TRUE(bundle.node->has_read_lease());
+
+    // Advance 130ms. Peer 2's ack is now 130ms old (< 140ms), still valid.
+    clock.advance(std::chrono::milliseconds{130});
+    EXPECT_TRUE(bundle.node->has_read_lease());
+
+    // Get ack from peer 3 at this point (peer 3's ack is fresh).
+    ack_append_entries(*bundle.node, 3);
+    pump(ioc);
+    EXPECT_TRUE(bundle.node->has_read_lease());
+
+    // Advance 20ms more. Now peer 2's ack is 150ms old (> 140ms, stale),
+    // but peer 3's ack is 20ms old (fresh). Self + peer 3 = 2/3 = majority.
+    clock.advance(std::chrono::milliseconds{20});
+    // has_read_lease checks lease_start_ which was renewed by the peer 3 ack.
+    // The lease_start_ was set when peer 3 acked (at the 140ms mark).
+    // Now at 160ms mark. 160 - 140 = 20ms < 140ms → still valid.
+    EXPECT_TRUE(bundle.node->has_read_lease());
+
+    bundle.node->stop();
+    pump(ioc);
+}
+
+TEST_F(ReadLeaseTest, LeaseTimingBoundary) {
+    boost::asio::io_context ioc;
+    MockClock clock;
+    auto bundle = make_leader_with_clock(ioc, clock);
+
+    // Get lease.
+    clock.advance(std::chrono::milliseconds{10});
+    ack_append_entries(*bundle.node, 2);
+    pump(ioc);
+    ASSERT_TRUE(bundle.node->has_read_lease());
+
+    // Advance exactly kLeaseDuration (140ms) — should still be valid (<=).
+    clock.advance(std::chrono::milliseconds{140});
+    EXPECT_TRUE(bundle.node->has_read_lease());
+
+    // Advance 1 more ms — should now be expired.
+    clock.advance(std::chrono::milliseconds{1});
+    EXPECT_FALSE(bundle.node->has_read_lease());
+
+    bundle.node->stop();
+    pump(ioc);
+}
+
+TEST_F(ReadLeaseTest, LeaseWithDefaultClock) {
+    // Verify that a node without an injected clock uses the default SteadyClock.
+    boost::asio::io_context ioc;
+    MockTransport transport;
+    DeterministicTimerFactory timer_factory;
+
+    // No clock parameter → uses default_clock_ (SteadyClock).
+    RaftNode node(ioc, 1, {2, 3}, transport, timer_factory, logger_);
+    node.start();
+    pump(ioc);
+
+    // Elect as leader.
+    timer_factory.timer(0)->fire();
+    pump(ioc);
+    for (const auto* msg : transport.find_request_vote()) {
+        RequestVoteResponse resp;
+        resp.set_term(node.current_term());
+        resp.set_vote_granted(true);
+        node.handle_vote_response(msg->peer_id, resp);
+    }
+    pump(ioc);
+    ASSERT_EQ(node.state(), kv::NodeState::Leader);
+
+    // No acks yet → no lease.
+    EXPECT_FALSE(node.has_read_lease());
+
+    // Send an ack — with real clock, lease should be valid immediately after.
+    ack_append_entries(node, 2);
+    pump(ioc);
+    EXPECT_TRUE(node.has_read_lease());
+
+    node.stop();
+    pump(ioc);
 }

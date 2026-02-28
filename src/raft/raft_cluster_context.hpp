@@ -45,6 +45,10 @@ public:
         return node_.state() == NodeState::Leader;
     }
 
+    [[nodiscard]] bool has_read_lease() const noexcept override {
+        return node_.has_read_lease();
+    }
+
     [[nodiscard]] std::optional<std::string> leader_address() const override {
         auto lid = node_.leader_id();
         if (!lid) return std::nullopt;
