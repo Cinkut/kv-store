@@ -45,6 +45,10 @@ public:
     // Must be called after set_raft_node() and after PeerManager::start().
     void start_receive_loops();
 
+    // Start a receive loop for a single peer (for dynamically added peers).
+    // Must be called after set_raft_node().
+    void start_receive_loop_for(uint32_t peer_id);
+
     // Send a RaftMessage to a peer.  Returns true on success.
     boost::asio::awaitable<bool>
     send(uint32_t peer_id, RaftMessage msg) override;

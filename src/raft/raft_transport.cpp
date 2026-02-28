@@ -108,6 +108,22 @@ void RaftTransport::start_receive_loops()
                   peer_manager_.clients().size());
 }
 
+void RaftTransport::start_receive_loop_for(uint32_t peer_id)
+{
+    auto client = find_client(peer_id);
+    if (!client) {
+        logger_->warn("RaftTransport: cannot start receive loop for peer {} "
+                      "(not found in PeerManager)", peer_id);
+        return;
+    }
+
+    asio::co_spawn(raft_node_->strand(),
+                   receive_loop(client),
+                   asio::detached);
+
+    logger_->info("RaftTransport: started receive loop for peer {}", peer_id);
+}
+
 asio::awaitable<void>
 RaftTransport::receive_loop(std::shared_ptr<kv::network::PeerClient> client)
 {
