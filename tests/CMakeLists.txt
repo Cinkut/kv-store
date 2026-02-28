@@ -9,6 +9,7 @@ add_executable(kvstore_tests
     redirect_test.cpp
     wal_test.cpp
     snapshot_test.cpp
+    binary_protocol_test.cpp
 )
 target_link_libraries(kvstore_tests
     PRIVATE

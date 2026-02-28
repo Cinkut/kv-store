@@ -329,7 +329,7 @@ std::variant<Response, ErrorResp> parse_binary_response(
             if (ptr + msg_len > end) {
                 return ErrorResp{"binary response: truncated error message"};
             }
-            return ErrorResp{std::string(reinterpret_cast<const char*>(ptr), msg_len)};
+            return Response{ErrorResp{std::string(reinterpret_cast<const char*>(ptr), msg_len)}};
         }
 
         case binary::kStatusRedirect: {
