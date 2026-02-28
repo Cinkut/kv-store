@@ -75,6 +75,16 @@ public:
     [[nodiscard]] const std::vector<std::shared_ptr<PeerClient>>&
     clients() const noexcept { return clients_; }
 
+    // ── Dynamic membership ────────────────────────────────────────────────────
+
+    // Add a new peer at runtime.  Creates a PeerClient and starts it.
+    // Returns false if a peer with the given id already exists.
+    bool add_peer(uint32_t peer_id, const std::string& host, uint16_t raft_port);
+
+    // Remove a peer at runtime.  Stops the PeerClient and removes it.
+    // Returns false if no peer with the given id exists.
+    bool remove_peer(uint32_t peer_id);
+
 private:
     // Periodic coroutine: logs connectivity status every kMonitorInterval.
     boost::asio::awaitable<void> monitor_loop();

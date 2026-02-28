@@ -1,5 +1,7 @@
 #include "network/peer_manager.hpp"
 
+#include <algorithm>
+
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/co_spawn.hpp>
@@ -119,6 +121,60 @@ boost::asio::awaitable<void> PeerManager::monitor_loop() {
     }
 
     logger_->debug("PeerManager [node={}] monitor loop exited", node_id_);
+}
+
+// ── Dynamic membership ───────────────────────────────────────────────────────
+
+bool PeerManager::add_peer(uint32_t peer_id, const std::string& host,
+                           uint16_t raft_port) {
+    // Check if a peer with this id already exists.
+    for (const auto& c : clients_) {
+        if (c->peer_id() == peer_id) {
+            logger_->warn("PeerManager [node={}] add_peer: peer {} already exists",
+                          node_id_, peer_id);
+            return false;
+        }
+    }
+
+    auto state_cb = [this, peer_id](ConnectionState s) {
+        const char* name = [](ConnectionState st) {
+            switch (st) {
+                case ConnectionState::Disconnected: return "Disconnected";
+                case ConnectionState::Connecting:   return "Connecting";
+                case ConnectionState::Connected:    return "Connected";
+            }
+            return "Unknown";
+        }(s);
+        logger_->info("PeerManager [node={}] peer {} → {}",
+                      node_id_, peer_id, name);
+    };
+
+    auto client = std::make_shared<PeerClient>(
+        ioc_, peer_id, host, raft_port, logger_, std::move(state_cb));
+
+    client->start();
+    clients_.push_back(std::move(client));
+
+    logger_->info("PeerManager [node={}] added peer {} ({}:{})",
+                  node_id_, peer_id, host, raft_port);
+    return true;
+}
+
+bool PeerManager::remove_peer(uint32_t peer_id) {
+    auto it = std::find_if(clients_.begin(), clients_.end(),
+        [peer_id](const auto& c) { return c->peer_id() == peer_id; });
+
+    if (it == clients_.end()) {
+        logger_->warn("PeerManager [node={}] remove_peer: peer {} not found",
+                      node_id_, peer_id);
+        return false;
+    }
+
+    (*it)->stop();
+    clients_.erase(it);
+
+    logger_->info("PeerManager [node={}] removed peer {}", node_id_, peer_id);
+    return true;
 }
 
 } // namespace kv::network
