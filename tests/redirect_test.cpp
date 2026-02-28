@@ -56,6 +56,15 @@ public:
         co_return true;
     }
 
+    bool submit_config_change(std::vector<kv::AddServerCmd> /*add_nodes*/,
+                              std::vector<uint32_t> /*remove_node_ids*/) override {
+        return true;
+    }
+
+    std::vector<NodeEntry> current_nodes() const override {
+        return {};
+    }
+
     // Test controls.
     void set_leader(bool val) { is_leader_ = val; }
     void set_leader_address(std::optional<std::string> addr) {

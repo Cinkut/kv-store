@@ -100,6 +100,41 @@ map_command(const std::vector<std::string>& args) {
     } else if (verb == "COMMAND") {
         // Redis clients send COMMAND DOCS on connect — reply with OK.
         return PingCmd{};  // We'll respond with PONG, which is harmless.
+    } else if (verb == "ADDSERVER") {
+        // ADDSERVER id host raft_port client_port
+        if (args.size() != 5) {
+            return ErrorResp{"ERR wrong number of arguments for 'ADDSERVER' command"};
+        }
+        uint32_t id = 0;
+        auto [p1, e1] = std::from_chars(args[1].data(),
+                                         args[1].data() + args[1].size(), id);
+        if (e1 != std::errc{} || p1 != args[1].data() + args[1].size() || id == 0) {
+            return ErrorResp{"ERR ADDSERVER: invalid node id"};
+        }
+        uint16_t raft_port = 0;
+        auto [p2, e2] = std::from_chars(args[3].data(),
+                                         args[3].data() + args[3].size(), raft_port);
+        if (e2 != std::errc{} || p2 != args[3].data() + args[3].size() || raft_port == 0) {
+            return ErrorResp{"ERR ADDSERVER: invalid raft_port"};
+        }
+        uint16_t client_port = 0;
+        auto [p3, e3] = std::from_chars(args[4].data(),
+                                         args[4].data() + args[4].size(), client_port);
+        if (e3 != std::errc{} || p3 != args[4].data() + args[4].size() || client_port == 0) {
+            return ErrorResp{"ERR ADDSERVER: invalid client_port"};
+        }
+        return AddServerCmd{id, args[2], raft_port, client_port};
+    } else if (verb == "REMOVESERVER") {
+        if (args.size() != 2) {
+            return ErrorResp{"ERR wrong number of arguments for 'REMOVESERVER' command"};
+        }
+        uint32_t id = 0;
+        auto [p1, e1] = std::from_chars(args[1].data(),
+                                         args[1].data() + args[1].size(), id);
+        if (e1 != std::errc{} || p1 != args[1].data() + args[1].size() || id == 0) {
+            return ErrorResp{"ERR REMOVESERVER: invalid node id"};
+        }
+        return RemoveServerCmd{id};
     } else {
         return ErrorResp{"ERR unknown command '" + verb + "'"};
     }
@@ -239,6 +274,15 @@ std::string serialize_resp_request(const Command& cmd) {
                 return "*2\r\n" + bulk("DEL") + bulk(c.key);
             } else if constexpr (std::is_same_v<T, KeysCmd>) {
                 return "*2\r\n$4\r\nKEYS\r\n$1\r\n*\r\n";
+            } else if constexpr (std::is_same_v<T, AddServerCmd>) {
+                auto id_str = std::to_string(c.node_id);
+                auto rp_str = std::to_string(c.raft_port);
+                auto cp_str = std::to_string(c.client_port);
+                return "*5\r\n" + bulk("ADDSERVER") + bulk(id_str)
+                       + bulk(c.host) + bulk(rp_str) + bulk(cp_str);
+            } else if constexpr (std::is_same_v<T, RemoveServerCmd>) {
+                auto id_str = std::to_string(c.node_id);
+                return "*2\r\n" + bulk("REMOVESERVER") + bulk(id_str);
             }
         },
         cmd);

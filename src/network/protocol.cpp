@@ -1,5 +1,6 @@
 #include "network/protocol.hpp"
 
+#include <charconv>
 #include <sstream>
 #include <string>
 
@@ -91,6 +92,68 @@ std::variant<Command, ErrorResp> parse_command(std::string_view line) {
             return ErrorResp{"SET requires a value"};
         }
         return SetCmd{std::string(key), std::string(value)};
+    }
+
+    // ── ADDSERVER id host raft_port client_port ───────────────────────────────
+    if (verb == "ADDSERVER") {
+        if (rest.empty()) {
+            return ErrorResp{"ADDSERVER requires: id host raft_port client_port"};
+        }
+        auto [id_tok, after_id] = split_once(rest);
+        if (after_id.empty()) {
+            return ErrorResp{"ADDSERVER requires: id host raft_port client_port"};
+        }
+        auto [host_tok, after_host] = split_once(after_id);
+        if (after_host.empty()) {
+            return ErrorResp{"ADDSERVER requires: id host raft_port client_port"};
+        }
+        auto [rport_tok, after_rport] = split_once(after_host);
+        if (after_rport.empty()) {
+            return ErrorResp{"ADDSERVER requires: id host raft_port client_port"};
+        }
+        auto [cport_tok, extra] = split_once(after_rport);
+        if (!extra.empty()) {
+            return ErrorResp{"ADDSERVER takes exactly 4 arguments"};
+        }
+
+        uint32_t id = 0;
+        auto [p1, e1] = std::from_chars(id_tok.data(), id_tok.data() + id_tok.size(), id);
+        if (e1 != std::errc{} || p1 != id_tok.data() + id_tok.size() || id == 0) {
+            return ErrorResp{"ADDSERVER: invalid node id"};
+        }
+
+        uint16_t raft_port = 0;
+        auto [p2, e2] = std::from_chars(rport_tok.data(), rport_tok.data() + rport_tok.size(), raft_port);
+        if (e2 != std::errc{} || p2 != rport_tok.data() + rport_tok.size() || raft_port == 0) {
+            return ErrorResp{"ADDSERVER: invalid raft_port"};
+        }
+
+        uint16_t client_port = 0;
+        auto [p3, e3] = std::from_chars(cport_tok.data(), cport_tok.data() + cport_tok.size(), client_port);
+        if (e3 != std::errc{} || p3 != cport_tok.data() + cport_tok.size() || client_port == 0) {
+            return ErrorResp{"ADDSERVER: invalid client_port"};
+        }
+
+        return AddServerCmd{id, std::string(host_tok), raft_port, client_port};
+    }
+
+    // ── REMOVESERVER id ──────────────────────────────────────────────────────
+    if (verb == "REMOVESERVER") {
+        if (rest.empty()) {
+            return ErrorResp{"REMOVESERVER requires a node id"};
+        }
+        auto [id_tok, extra] = split_once(rest);
+        if (!extra.empty()) {
+            return ErrorResp{"REMOVESERVER takes exactly one argument"};
+        }
+
+        uint32_t id = 0;
+        auto [p1, e1] = std::from_chars(id_tok.data(), id_tok.data() + id_tok.size(), id);
+        if (e1 != std::errc{} || p1 != id_tok.data() + id_tok.size() || id == 0) {
+            return ErrorResp{"REMOVESERVER: invalid node id"};
+        }
+
+        return RemoveServerCmd{id};
     }
 
     return ErrorResp{"unknown command: " + std::string(verb)};

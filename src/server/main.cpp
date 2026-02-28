@@ -207,9 +207,81 @@ int main(int argc, char* argv[]) {
         logger->debug("Applied committed entry index={}", entry.index());
     };
 
+    // Pointer to cluster context (set after construction, used in config callback).
+    kv::raft::RaftClusterContext* cluster_ctx_ptr = nullptr;
+
+    // Config change callback: update PeerManager, Transport, and ClusterContext
+    // when cluster membership changes.
+    auto config_change_callback = [&peer_mgr, &transport, &cluster_ctx_ptr, &logger,
+                                    &cfg](
+        const kv::raft::ClusterConfiguration& new_config,
+        const kv::raft::LogEntry& /*entry*/) {
+
+        // Determine which peers to add/remove by comparing with current peers.
+        const auto all_new_peers = new_config.all_peer_ids();
+        std::set<uint32_t> new_peer_set(all_new_peers.begin(), all_new_peers.end());
+
+        // Add new peers that PeerManager doesn't know about.
+        for (const auto& node : new_config.nodes()) {
+            if (node.id() == cfg.id) continue;  // skip self
+            if (node.host().empty()) continue;    // skip nodes without address info
+
+            // Try to add — PeerManager::add_peer() is a no-op if already exists.
+            bool added = peer_mgr.add_peer(
+                node.id(), node.host(),
+                static_cast<uint16_t>(node.raft_port()));
+            if (added) {
+                logger->info("Config change: added peer {} ({}:{}:{})",
+                             node.id(), node.host(),
+                             node.raft_port(), node.client_port());
+                transport.start_receive_loop_for(node.id());
+            }
+
+            // Update cluster context address map.
+            if (cluster_ctx_ptr) {
+                cluster_ctx_ptr->update_peer_address(
+                    node.id(),
+                    node.host() + ":" + std::to_string(node.client_port()));
+            }
+        }
+
+        // Also handle old-config nodes during joint consensus.
+        for (const auto& node : new_config.old_nodes()) {
+            if (node.id() == cfg.id) continue;
+            if (node.host().empty()) continue;
+
+            bool added = peer_mgr.add_peer(
+                node.id(), node.host(),
+                static_cast<uint16_t>(node.raft_port()));
+            if (added) {
+                logger->info("Config change (joint): added old peer {} ({}:{})",
+                             node.id(), node.host(), node.raft_port());
+                transport.start_receive_loop_for(node.id());
+            }
+        }
+
+        // When finalizing (not joint), remove peers that are no longer in config.
+        if (!new_config.is_joint()) {
+            // Snapshot the current client list (copy the vector of shared_ptrs)
+            // so we can safely remove while iterating.
+            auto current_clients = peer_mgr.clients();
+            for (const auto& client : current_clients) {
+                const auto pid = client->peer_id();
+                if (!new_peer_set.contains(pid)) {
+                    logger->info("Config change: removing peer {}", pid);
+                    peer_mgr.remove_peer(pid);
+                    if (cluster_ctx_ptr) {
+                        cluster_ctx_ptr->remove_peer_address(pid);
+                    }
+                }
+            }
+        }
+    };
+
     kv::raft::RaftNode raft_node{
         ioc, cfg.id, peer_ids, transport, timer_factory, logger,
-        apply_callback, &snapshot_io, cfg.snapshot_interval, &persist_cb};
+        apply_callback, &snapshot_io, cfg.snapshot_interval, &persist_cb,
+        nullptr, config_change_callback};
 
     // Wire the RaftNode into the transport so responses can be dispatched.
     transport.set_raft_node(&raft_node);
@@ -229,6 +301,7 @@ int main(int argc, char* argv[]) {
     // ── Cluster context (bridges Session ↔ Raft) ─────────────────────────────
     kv::raft::RaftClusterContext cluster_ctx{
         raft_node, commit_awaiter, peer_addresses, logger};
+    cluster_ctx_ptr = &cluster_ctx;
 
     // ── Raft RPC listener (inbound peer messages) ────────────────────────────
     kv::raft::RaftRpcListener raft_listener{

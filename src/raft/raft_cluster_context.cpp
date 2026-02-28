@@ -46,4 +46,74 @@ RaftClusterContext::submit_write(const std::string& key,
     co_return committed;
 }
 
+bool RaftClusterContext::submit_config_change(
+    std::vector<kv::AddServerCmd> add_nodes,
+    std::vector<uint32_t> remove_node_ids) {
+
+    if (node_.state() != NodeState::Leader) {
+        if (logger_) {
+            logger_->warn("RaftClusterContext: config change called on non-leader");
+        }
+        return false;
+    }
+
+    // Build the new node list from current config + additions - removals.
+    const auto& current_config = node_.config();
+    std::vector<NodeInfo> new_nodes;
+
+    // Keep existing nodes that aren't being removed.
+    std::set<uint32_t> remove_set(remove_node_ids.begin(), remove_node_ids.end());
+    for (const auto& node : current_config.nodes()) {
+        if (!remove_set.contains(node.id())) {
+            new_nodes.push_back(node);
+        }
+    }
+
+    // Add new nodes.
+    for (const auto& add : add_nodes) {
+        // Check if this node already exists.
+        bool exists = false;
+        for (const auto& existing : new_nodes) {
+            if (existing.id() == add.node_id) {
+                exists = true;
+                break;
+            }
+        }
+        if (exists) {
+            if (logger_) {
+                logger_->warn("RaftClusterContext: node {} already in config", add.node_id);
+            }
+            return false;
+        }
+        NodeInfo info;
+        info.set_id(add.node_id);
+        info.set_host(add.host);
+        info.set_raft_port(add.raft_port);
+        info.set_client_port(add.client_port);
+        new_nodes.push_back(std::move(info));
+    }
+
+    if (logger_) {
+        logger_->info("RaftClusterContext: submitting config change ({} nodes → {} nodes)",
+                       current_config.cluster_size(), new_nodes.size());
+    }
+
+    return node_.submit_config_change(std::move(new_nodes));
+}
+
+std::vector<network::ClusterContext::NodeEntry>
+RaftClusterContext::current_nodes() const {
+    std::vector<NodeEntry> result;
+    const auto& current_config = node_.config();
+    for (const auto& node : current_config.nodes()) {
+        result.push_back({
+            node.id(),
+            node.host(),
+            static_cast<uint16_t>(node.raft_port()),
+            static_cast<uint16_t>(node.client_port())
+        });
+    }
+    return result;
+}
+
 } // namespace kv::raft

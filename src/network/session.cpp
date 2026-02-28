@@ -336,6 +336,42 @@ boost::asio::awaitable<Response> Session::dispatch(const Command& cmd) {
                     }
                 }
                 co_return KeysResp{storage_.keys()};
+
+            } else if constexpr (std::is_same_v<T, AddServerCmd>) {
+                // Admin command: add a server to the cluster.
+                if (!cluster_ctx_) {
+                    co_return ErrorResp{"ADDSERVER not available in standalone mode"};
+                }
+                if (!cluster_ctx_->is_leader()) {
+                    auto addr = cluster_ctx_->leader_address();
+                    if (addr) {
+                        co_return RedirectResp{std::move(*addr)};
+                    }
+                    co_return ErrorResp{"no leader available"};
+                }
+                bool ok = cluster_ctx_->submit_config_change({c}, {});
+                if (!ok) {
+                    co_return ErrorResp{"config change failed (another in progress?)"};
+                }
+                co_return OkResp{};
+
+            } else if constexpr (std::is_same_v<T, RemoveServerCmd>) {
+                // Admin command: remove a server from the cluster.
+                if (!cluster_ctx_) {
+                    co_return ErrorResp{"REMOVESERVER not available in standalone mode"};
+                }
+                if (!cluster_ctx_->is_leader()) {
+                    auto addr = cluster_ctx_->leader_address();
+                    if (addr) {
+                        co_return RedirectResp{std::move(*addr)};
+                    }
+                    co_return ErrorResp{"no leader available"};
+                }
+                bool ok = cluster_ctx_->submit_config_change({}, {c.node_id});
+                if (!ok) {
+                    co_return ErrorResp{"config change failed (another in progress?)"};
+                }
+                co_return OkResp{};
             }
         },
         cmd);

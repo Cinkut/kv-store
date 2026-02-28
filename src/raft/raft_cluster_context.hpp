@@ -24,6 +24,8 @@ namespace kv::raft {
 // - is_leader() queries RaftNode::state()
 // - leader_address() resolves leader_id to host:client_port using peer info
 // - submit_write() submits to RaftNode::submit(), then awaits CommitAwaiter
+// - submit_config_change() builds the new NodeInfo list and calls
+//   RaftNode::submit_config_change()
 //
 // NOT thread-safe — all methods must be called from the Raft strand or
 // the session coroutine (which runs on the same io_context).
@@ -60,6 +62,21 @@ public:
     [[nodiscard]] boost::asio::awaitable<bool>
     submit_write(const std::string& key, const std::string& value,
                  int type) override;
+
+    [[nodiscard]] bool
+    submit_config_change(std::vector<AddServerCmd> add_nodes,
+                         std::vector<uint32_t> remove_node_ids) override;
+
+    [[nodiscard]] std::vector<NodeEntry> current_nodes() const override;
+
+    // Update the peer_addresses map when nodes are added/removed.
+    void update_peer_address(uint32_t node_id, const std::string& address) {
+        peer_addresses_[node_id] = address;
+    }
+
+    void remove_peer_address(uint32_t node_id) {
+        peer_addresses_.erase(node_id);
+    }
 
 private:
     RaftNode& node_;

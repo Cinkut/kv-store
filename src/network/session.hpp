@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace kv::network {
 
@@ -38,6 +39,26 @@ public:
     // `type` is 1 for SET, 2 for DEL (matching protobuf CommandType enum).
     [[nodiscard]] virtual boost::asio::awaitable<bool>
     submit_write(const std::string& key, const std::string& value, int type) = 0;
+
+    // Submit a cluster configuration change (add/remove server).
+    // `new_nodes` is the desired final cluster membership list.
+    // Returns true if the config change was successfully initiated.
+    // Returns false if this node is not the leader or another config change
+    // is already in progress.
+    [[nodiscard]] virtual bool
+    submit_config_change(std::vector<AddServerCmd> add_nodes,
+                         std::vector<uint32_t> remove_node_ids) = 0;
+
+    // Get current cluster membership info for building the new config.
+    // Returns a list of {node_id, host, raft_port, client_port} tuples
+    // for all nodes (including self) in the current configuration.
+    struct NodeEntry {
+        uint32_t id;
+        std::string host;
+        uint16_t raft_port;
+        uint16_t client_port;
+    };
+    [[nodiscard]] virtual std::vector<NodeEntry> current_nodes() const = 0;
 };
 
 // Handles one TCP connection for its lifetime.

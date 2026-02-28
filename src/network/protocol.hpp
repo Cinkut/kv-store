@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -30,7 +31,21 @@ struct KeysCmd {};
 
 struct PingCmd {};
 
-using Command = std::variant<SetCmd, GetCmd, DelCmd, KeysCmd, PingCmd>;
+// ── Admin commands (cluster management) ──────────────────────────────────────
+
+struct AddServerCmd {
+    uint32_t node_id;
+    std::string host;
+    uint16_t raft_port;
+    uint16_t client_port;
+};
+
+struct RemoveServerCmd {
+    uint32_t node_id;
+};
+
+using Command = std::variant<SetCmd, GetCmd, DelCmd, KeysCmd, PingCmd,
+                             AddServerCmd, RemoveServerCmd>;
 
 // ── Responses ─────────────────────────────────────────────────────────────────
 
