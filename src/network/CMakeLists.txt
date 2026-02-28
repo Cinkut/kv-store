@@ -3,6 +3,7 @@ add_library(kv_network STATIC
     session.cpp
     protocol.cpp
     peer_client.cpp
+    peer_manager.cpp
 )
 target_include_directories(kv_network PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(kv_network

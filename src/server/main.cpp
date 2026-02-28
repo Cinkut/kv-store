@@ -1,5 +1,6 @@
 #include "common/logger.hpp"
 #include "common/node_config.hpp"
+#include "network/peer_manager.hpp"
 #include "network/server.hpp"
 #include "storage/storage.hpp"
 
@@ -31,12 +32,18 @@ int main(int argc, char* argv[]) {
         logger->debug("  peer id={} host={} raft_port={}", peer.id, peer.host, peer.raft_port);
     }
 
-    // ── Storage + Server ──────────────────────────────────────────────────────
+    // ── Storage + Network ─────────────────────────────────────────────────────
     kv::Storage storage;
     kv::network::Server server{cfg.host, cfg.client_port, storage};
 
+    // PeerManager needs the io_context from the Server.
+    // We start the peer manager before running the server event loop.
+    kv::network::PeerManager peer_mgr{server.io_context(), cfg, logger};
+    peer_mgr.start();
+
     server.run(); // blocks until SIGINT/SIGTERM
 
+    peer_mgr.stop();
     logger->info("kv-server stopped");
     return 0;
 }

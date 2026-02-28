@@ -4,6 +4,7 @@ add_executable(kvstore_tests
     integration_test.cpp
     node_config_test.cpp
     peer_client_test.cpp
+    peer_manager_test.cpp
 )
 target_link_libraries(kvstore_tests
     PRIVATE

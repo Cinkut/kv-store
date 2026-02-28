@@ -29,6 +29,10 @@ public:
     // signal handler.
     void stop();
 
+    // Returns a reference to the underlying io_context.
+    // Used by PeerManager and future Raft components that share the event loop.
+    [[nodiscard]] boost::asio::io_context& io_context() noexcept { return ioc_; }
+
 private:
     // Accept loop coroutine – runs indefinitely on the io_context.
     boost::asio::awaitable<void> accept_loop();
