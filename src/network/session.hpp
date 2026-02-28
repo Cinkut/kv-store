@@ -1,7 +1,7 @@
 #pragma once
 
 #include "network/protocol.hpp"
-#include "storage/storage.hpp"
+#include "storage/storage_engine.hpp"
 
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -51,10 +51,10 @@ public:
 class Session {
 public:
     // Standalone mode (no Raft) – all commands execute locally.
-    Session(boost::asio::ip::tcp::socket socket, Storage& storage);
+    Session(boost::asio::ip::tcp::socket socket, StorageEngine& storage);
 
     // Cluster mode – write commands may be redirected to the leader.
-    Session(boost::asio::ip::tcp::socket socket, Storage& storage,
+    Session(boost::asio::ip::tcp::socket socket, StorageEngine& storage,
             ClusterContext& cluster_ctx);
 
     // Main coroutine.  Auto-detects protocol, then loops reading commands,
@@ -86,7 +86,7 @@ private:
                                           uint8_t first_byte);
 
     boost::asio::ip::tcp::socket socket_;
-    Storage& storage_;
+    StorageEngine& storage_;
     ClusterContext* cluster_ctx_ = nullptr; // null in standalone mode
 };
 

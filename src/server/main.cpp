@@ -13,6 +13,7 @@
 #include "raft/real_timer.hpp"
 #include "raft/state_machine.hpp"
 #include "storage/storage.hpp"
+#include "storage/storage_engine.hpp"
 
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/co_spawn.hpp>

@@ -23,10 +23,10 @@ namespace {
 constexpr auto use_awaitable = boost::asio::as_tuple(boost::asio::use_awaitable);
 } // namespace
 
-Session::Session(boost::asio::ip::tcp::socket socket, Storage& storage)
+Session::Session(boost::asio::ip::tcp::socket socket, StorageEngine& storage)
     : socket_(std::move(socket)), storage_(storage) {}
 
-Session::Session(boost::asio::ip::tcp::socket socket, Storage& storage,
+Session::Session(boost::asio::ip::tcp::socket socket, StorageEngine& storage,
                  ClusterContext& cluster_ctx)
     : socket_(std::move(socket)), storage_(storage), cluster_ctx_(&cluster_ctx) {}
 

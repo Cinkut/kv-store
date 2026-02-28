@@ -4,7 +4,7 @@
 
 namespace kv::raft {
 
-StateMachine::StateMachine(Storage& storage,
+StateMachine::StateMachine(StorageEngine& storage,
                            std::shared_ptr<spdlog::logger> logger)
     : storage_(storage)
     , logger_(std::move(logger))

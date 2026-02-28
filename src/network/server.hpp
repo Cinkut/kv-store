@@ -1,6 +1,6 @@
 #pragma once
 
-#include "storage/storage.hpp"
+#include "storage/storage_engine.hpp"
 
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/io_context.hpp>
@@ -22,10 +22,10 @@ class ClusterContext;
 class Server {
 public:
     // Standalone mode (no Raft).
-    Server(std::string host, std::uint16_t port, Storage& storage);
+    Server(std::string host, std::uint16_t port, StorageEngine& storage);
 
     // Cluster mode — pass a ClusterContext for Raft-backed writes.
-    Server(std::string host, std::uint16_t port, Storage& storage,
+    Server(std::string host, std::uint16_t port, StorageEngine& storage,
            ClusterContext& cluster_ctx);
 
     // Starts the thread pool, begins accepting connections, and installs signal
@@ -47,7 +47,7 @@ private:
 
     std::string host_;
     std::uint16_t port_;
-    Storage& storage_;
+    StorageEngine& storage_;
     ClusterContext* cluster_ctx_ = nullptr;
 
     boost::asio::io_context ioc_;

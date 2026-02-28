@@ -18,7 +18,7 @@
 
 namespace kv::network {
 
-Server::Server(std::string host, std::uint16_t port, Storage& storage)
+Server::Server(std::string host, std::uint16_t port, StorageEngine& storage)
     : host_(std::move(host)),
       port_(port),
       storage_(storage),
@@ -35,7 +35,7 @@ Server::Server(std::string host, std::uint16_t port, Storage& storage)
     spdlog::info("Server listening on {}:{}", host_, port_);
 }
 
-Server::Server(std::string host, std::uint16_t port, Storage& storage,
+Server::Server(std::string host, std::uint16_t port, StorageEngine& storage,
                ClusterContext& cluster_ctx)
     : host_(std::move(host)),
       port_(port),

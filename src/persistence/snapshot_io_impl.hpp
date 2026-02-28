@@ -3,7 +3,7 @@
 #include "raft/raft_node.hpp"
 #include "persistence/snapshot.hpp"
 #include "persistence/wal.hpp"
-#include "storage/storage.hpp"
+#include "storage/storage_engine.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -25,11 +25,11 @@ class SnapshotIOImpl final : public kv::raft::SnapshotIO {
 public:
     // Constructor.
     //   data_dir – node's data directory (snapshot.bin lives here)
-    //   storage  – the live kv::Storage (state machine backing store)
+    //   storage  – the live kv::StorageEngine (state machine backing store)
     //   wal      – the Write-Ahead Log (rewritten after snapshot creation)
     //   logger   – per-node spdlog logger
     SnapshotIOImpl(const std::filesystem::path& data_dir,
-                   kv::Storage& storage,
+                   kv::StorageEngine& storage,
                    WAL& wal,
                    std::shared_ptr<spdlog::logger> logger);
 
@@ -53,7 +53,7 @@ public:
 
 private:
     std::filesystem::path snapshot_path_;
-    kv::Storage& storage_;
+    kv::StorageEngine& storage_;
     WAL& wal_;
     std::shared_ptr<spdlog::logger> logger_;
 };

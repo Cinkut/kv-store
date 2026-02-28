@@ -6,7 +6,7 @@
 namespace kv::persistence {
 
 SnapshotIOImpl::SnapshotIOImpl(const std::filesystem::path& data_dir,
-                               kv::Storage& storage,
+                               kv::StorageEngine& storage,
                                WAL& wal,
                                std::shared_ptr<spdlog::logger> logger)
     : snapshot_path_{data_dir / Snapshot::kFilename}

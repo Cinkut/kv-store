@@ -6,7 +6,7 @@
 #include <spdlog/spdlog.h>
 
 #include "raft.pb.h"
-#include "storage/storage.hpp"
+#include "storage/storage_engine.hpp"
 
 namespace kv::raft {
 
@@ -19,7 +19,7 @@ namespace kv::raft {
 
 class StateMachine {
 public:
-    explicit StateMachine(Storage& storage,
+    explicit StateMachine(StorageEngine& storage,
                           std::shared_ptr<spdlog::logger> logger = {});
 
     // Apply a single committed log entry.
@@ -35,11 +35,11 @@ public:
     [[nodiscard]] uint64_t last_applied() const noexcept { return last_applied_; }
 
     // Direct access to underlying storage (for reads).
-    [[nodiscard]] Storage& storage() noexcept { return storage_; }
-    [[nodiscard]] const Storage& storage() const noexcept { return storage_; }
+    [[nodiscard]] StorageEngine& storage() noexcept { return storage_; }
+    [[nodiscard]] const StorageEngine& storage() const noexcept { return storage_; }
 
 private:
-    Storage& storage_;
+    StorageEngine& storage_;
     std::shared_ptr<spdlog::logger> logger_;
     uint64_t last_applied_ = 0;
 };
