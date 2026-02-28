@@ -4,6 +4,7 @@ add_library(kv_raft STATIC
     raft_log.cpp
     state_machine.cpp
     real_timer.cpp
+    raft_transport.cpp
 )
 
 # ── Protobuf code generation ──────────────────────────────────────────────────
@@ -24,6 +25,7 @@ target_link_libraries(kv_raft
     PUBLIC
         kv_common
         kv_storage
+        kv_network
         protobuf::libprotobuf
         Boost::asio
     PRIVATE
