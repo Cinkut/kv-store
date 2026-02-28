@@ -83,21 +83,30 @@ public:
         std::string data;               // raw snapshot bytes
         uint64_t last_included_index = 0;
         uint64_t last_included_term  = 0;
+        std::optional<ClusterConfig> config;  // cluster config at snapshot point
     };
     virtual SnapshotData load_snapshot_for_sending() = 0;
 
     // Install a snapshot received from the leader.  The implementation should:
     //   1. Save the snapshot data to disk
     //   2. Clear and reload the state machine (Storage) from snapshot data
+    //   3. Persist the cluster configuration alongside the snapshot
     // Returns true on success.
     virtual bool install_snapshot(const std::string& data,
                                  uint64_t last_included_index,
-                                 uint64_t last_included_term) = 0;
+                                 uint64_t last_included_term,
+                                 const std::optional<ClusterConfig>& config = {}) = 0;
 
     // Create a snapshot of the current state machine and truncate WAL.
+    // Persists the cluster configuration alongside the snapshot.
     // Returns true on success.
     virtual bool create_snapshot(uint64_t last_included_index,
-                                uint64_t last_included_term) = 0;
+                                uint64_t last_included_term,
+                                const std::optional<ClusterConfig>& config = {}) = 0;
+
+    // Load cluster configuration from persisted snapshot metadata.
+    // Returns nullopt if no config was persisted.
+    virtual std::optional<ClusterConfig> load_cluster_config() = 0;
 };
 
 // ── PersistCallback abstraction ──────────────────────────────────────────────
@@ -239,8 +248,10 @@ public:
 
     // Restore snapshot metadata (call after loading snapshot, before start).
     // Sets the snapshot_last_included_index/term and adjusts the log offset.
+    // If a ClusterConfig is provided, also restores the cluster membership.
     void restore_snapshot(uint64_t last_included_index,
-                          uint64_t last_included_term);
+                          uint64_t last_included_term,
+                          const std::optional<ClusterConfig>& config = {});
 
     // ── State queries ────────────────────────────────────────────────────────
 

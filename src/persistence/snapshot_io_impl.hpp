@@ -9,6 +9,7 @@
 
 #include <filesystem>
 #include <memory>
+#include <optional>
 
 namespace kv::persistence {
 
@@ -41,18 +42,30 @@ public:
     //   1. Save snapshot bytes to disk.
     //   2. Load snapshot, clear Storage, repopulate from snapshot data.
     //   3. Rewrite WAL (metadata only, no entries — they're in the snapshot).
+    //   4. Persist the cluster configuration alongside the snapshot.
     bool install_snapshot(const std::string& data,
                           uint64_t last_included_index,
-                          uint64_t last_included_term) override;
+                          uint64_t last_included_term,
+                          const std::optional<kv::raft::ClusterConfig>& config = {}) override;
 
     // Create a snapshot of the current Storage state and rewrite WAL.
     //   1. Save snapshot from Storage to disk.
     //   2. Rewrite WAL: keep metadata, drop entries ≤ last_included_index.
+    //   3. Persist the cluster configuration alongside the snapshot.
     bool create_snapshot(uint64_t last_included_index,
-                         uint64_t last_included_term) override;
+                         uint64_t last_included_term,
+                         const std::optional<kv::raft::ClusterConfig>& config = {}) override;
+
+    // Load cluster configuration from the persisted cluster_config.pb file.
+    // Returns nullopt if no config was persisted.
+    std::optional<kv::raft::ClusterConfig> load_cluster_config() override;
 
 private:
+    // Atomically write a ClusterConfig protobuf to config_path_.
+    void save_config(const kv::raft::ClusterConfig& config);
+
     std::filesystem::path snapshot_path_;
+    std::filesystem::path config_path_;    // cluster_config.pb alongside snapshot.bin
     kv::StorageEngine& storage_;
     WAL& wal_;
     std::shared_ptr<spdlog::logger> logger_;

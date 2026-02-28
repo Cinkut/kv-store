@@ -216,7 +216,10 @@ int main(int argc, char* argv[]) {
 
     // Restore Raft state from WAL/snapshot (before start).
     if (snapshot_last_index > 0) {
-        raft_node.restore_snapshot(snapshot_last_index, snapshot_last_term);
+        // Load cluster configuration persisted alongside the snapshot.
+        auto snapshot_config = snapshot_io.load_cluster_config();
+        raft_node.restore_snapshot(snapshot_last_index, snapshot_last_term,
+                                   snapshot_config);
     }
     if (restored_term > 0 || !restored_entries.empty()) {
         raft_node.restore(restored_term, restored_voted_for,

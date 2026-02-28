@@ -61,7 +61,8 @@ void RaftNode::restore(uint64_t term, int32_t voted_for,
 }
 
 void RaftNode::restore_snapshot(uint64_t last_included_index,
-                                uint64_t last_included_term) {
+                                uint64_t last_included_term,
+                                const std::optional<ClusterConfig>& config) {
     snapshot_last_included_index_ = last_included_index;
     snapshot_last_included_term_  = last_included_term;
 
@@ -74,6 +75,14 @@ void RaftNode::restore_snapshot(uint64_t last_included_index,
     }
     if (last_applied_ < last_included_index) {
         last_applied_ = last_included_index;
+    }
+
+    // Restore cluster configuration from the snapshot if present.
+    if (config.has_value() && config->new_nodes_size() > 0) {
+        config_ = ClusterConfiguration{node_id_, *config};
+        logger_->info("[restore] snapshot config: {} new nodes, {} old nodes, joint={}",
+                      config->new_nodes_size(), config->old_nodes_size(),
+                      config_.is_joint());
     }
 
     logger_->info("[restore] snapshot index={}, term={}", 
@@ -347,8 +356,14 @@ RaftNode::handle_install_snapshot(const InstallSnapshotRequest& req) {
 
     // Install the snapshot via the I/O layer.
     if (snapshot_io_) {
+        // Pass the cluster config from the request if present.
+        std::optional<ClusterConfig> config;
+        if (req.has_config() && req.config().new_nodes_size() > 0) {
+            config = req.config();
+        }
         bool ok = snapshot_io_->install_snapshot(
-            req.data(), req.last_included_index(), req.last_included_term());
+            req.data(), req.last_included_index(), req.last_included_term(),
+            config);
         if (!ok) {
             logger_->warn("[term={}] Failed to install snapshot from node {}",
                           current_term_, req.leader_id());
@@ -359,6 +374,17 @@ RaftNode::handle_install_snapshot(const InstallSnapshotRequest& req) {
     // Update snapshot state.
     snapshot_last_included_index_ = req.last_included_index();
     snapshot_last_included_term_  = req.last_included_term();
+
+    // Restore cluster configuration from the snapshot if present.
+    if (req.has_config() && req.config().new_nodes_size() > 0) {
+        config_ = ClusterConfiguration{node_id_, req.config()};
+        logger_->info("[term={}] Restored cluster config from snapshot "
+                      "({} new nodes, {} old nodes, joint={})",
+                      current_term_,
+                      req.config().new_nodes_size(),
+                      req.config().old_nodes_size(),
+                      config_.is_joint());
+    }
 
     // Truncate log: discard all entries up through the snapshot index.
     log_.truncate_prefix(req.last_included_index(), req.last_included_term());
@@ -849,6 +875,14 @@ asio::awaitable<void> RaftNode::send_install_snapshot_to(uint32_t peer_id) {
     req.set_last_included_term(snap.last_included_term);
     req.set_data(std::move(snap.data));
 
+    // Include cluster configuration at the snapshot point.
+    if (snap.config.has_value()) {
+        *req.mutable_config() = *snap.config;
+    } else {
+        // No persisted config — send current config as fallback.
+        *req.mutable_config() = config_.to_proto();
+    }
+
     RaftMessage msg;
     *msg.mutable_install_snapshot_req() = std::move(req);
 
@@ -923,9 +957,11 @@ void RaftNode::maybe_trigger_snapshot() {
     if (t) snap_term = *t;
 
     logger_->info("[term={}] Triggering snapshot at index {} (term={})",
-                  current_term_, last_applied_, snap_term);
+                   current_term_, last_applied_, snap_term);
 
-    bool ok = snapshot_io_->create_snapshot(last_applied_, snap_term);
+    // Include current cluster configuration in the snapshot.
+    auto config_proto = config_.to_proto();
+    bool ok = snapshot_io_->create_snapshot(last_applied_, snap_term, config_proto);
     if (ok) {
         snapshot_last_included_index_ = last_applied_;
         snapshot_last_included_term_  = snap_term;

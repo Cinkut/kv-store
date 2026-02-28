@@ -5,15 +5,56 @@
 
 namespace kv::persistence {
 
+static constexpr const char* kConfigFilename = "cluster_config.pb";
+
 SnapshotIOImpl::SnapshotIOImpl(const std::filesystem::path& data_dir,
                                kv::StorageEngine& storage,
                                WAL& wal,
                                std::shared_ptr<spdlog::logger> logger)
     : snapshot_path_{data_dir / Snapshot::kFilename}
+    , config_path_{data_dir / kConfigFilename}
     , storage_{storage}
     , wal_{wal}
     , logger_{std::move(logger)}
 {}
+
+// ── Helper: save cluster config to file ─────────────────────────────────────
+
+void SnapshotIOImpl::save_config(const kv::raft::ClusterConfig& config) {
+    auto tmp_path = config_path_;
+    tmp_path += ".tmp";
+
+    std::string serialized;
+    if (!config.SerializeToString(&serialized)) {
+        logger_->warn("SnapshotIOImpl: failed to serialize cluster config");
+        return;
+    }
+
+    std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
+    if (!ofs) {
+        logger_->warn("SnapshotIOImpl: failed to create temp config file {}",
+                      tmp_path.string());
+        return;
+    }
+    ofs.write(serialized.data(), static_cast<std::streamsize>(serialized.size()));
+    ofs.flush();
+    if (!ofs.good()) {
+        logger_->warn("SnapshotIOImpl: failed to write temp config file");
+        return;
+    }
+    ofs.close();
+
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, config_path_, ec);
+    if (ec) {
+        logger_->warn("SnapshotIOImpl: failed to rename config file: {}",
+                      ec.message());
+        return;
+    }
+
+    logger_->debug("SnapshotIOImpl: saved cluster config ({} new_nodes, {} old_nodes)",
+                   config.new_nodes_size(), config.old_nodes_size());
+}
 
 // ── load_snapshot_for_sending ────────────────────────────────────────────────
 
@@ -46,16 +87,21 @@ SnapshotIOImpl::SnapshotData SnapshotIOImpl::load_snapshot_for_sending()
         return {};
     }
 
+    // Load cluster config if available.
+    auto config = load_cluster_config();
+
     logger_->debug("SnapshotIOImpl: loaded snapshot for sending "
-                   "(index={}, term={}, {} bytes)",
+                   "(index={}, term={}, {} bytes, config={})",
                    result.metadata.last_included_index,
                    result.metadata.last_included_term,
-                   raw_bytes.size());
+                   raw_bytes.size(),
+                   config.has_value() ? "yes" : "no");
 
     return {
         .data = std::move(raw_bytes),
         .last_included_index = result.metadata.last_included_index,
         .last_included_term  = result.metadata.last_included_term,
+        .config = std::move(config),
     };
 }
 
@@ -63,7 +109,8 @@ SnapshotIOImpl::SnapshotData SnapshotIOImpl::load_snapshot_for_sending()
 
 bool SnapshotIOImpl::install_snapshot(const std::string& data,
                                       uint64_t last_included_index,
-                                      uint64_t last_included_term)
+                                      uint64_t last_included_term,
+                                      const std::optional<kv::raft::ClusterConfig>& config)
 {
     // Step 1: Write the raw snapshot bytes to disk.
     //         The data is the full snapshot file content as produced by
@@ -129,6 +176,11 @@ bool SnapshotIOImpl::install_snapshot(const std::string& data,
         return false;
     }
 
+    // Step 4: Persist the cluster configuration alongside the snapshot.
+    if (config.has_value()) {
+        save_config(*config);
+    }
+
     logger_->info("SnapshotIOImpl: installed snapshot "
                   "(index={}, term={}, {} keys)",
                   last_included_index, last_included_term,
@@ -140,7 +192,8 @@ bool SnapshotIOImpl::install_snapshot(const std::string& data,
 // ── create_snapshot ──────────────────────────────────────────────────────────
 
 bool SnapshotIOImpl::create_snapshot(uint64_t last_included_index,
-                                     uint64_t last_included_term)
+                                     uint64_t last_included_term,
+                                     const std::optional<kv::raft::ClusterConfig>& config)
 {
     // Step 1: Save current Storage state as a snapshot.
     auto data = storage_.snapshot();
@@ -178,12 +231,50 @@ bool SnapshotIOImpl::create_snapshot(uint64_t last_included_index,
         return false;
     }
 
+    // Step 3: Persist the cluster configuration alongside the snapshot.
+    if (config.has_value()) {
+        save_config(*config);
+    }
+
     logger_->info("SnapshotIOImpl: created snapshot "
                   "(index={}, term={}, {} keys, {} WAL entries remaining)",
                   last_included_index, last_included_term,
                   data.size(), remaining.size());
 
     return true;
+}
+
+// ── load_cluster_config ─────────────────────────────────────────────────────
+
+std::optional<kv::raft::ClusterConfig> SnapshotIOImpl::load_cluster_config()
+{
+    if (!std::filesystem::exists(config_path_)) {
+        return std::nullopt;
+    }
+
+    std::ifstream ifs(config_path_, std::ios::binary);
+    if (!ifs) {
+        logger_->warn("SnapshotIOImpl: failed to open cluster config file {}",
+                      config_path_.string());
+        return std::nullopt;
+    }
+
+    std::string serialized(
+        (std::istreambuf_iterator<char>(ifs)),
+        std::istreambuf_iterator<char>());
+
+    kv::raft::ClusterConfig config;
+    if (!config.ParseFromString(serialized)) {
+        logger_->warn("SnapshotIOImpl: failed to parse cluster config from {}",
+                      config_path_.string());
+        return std::nullopt;
+    }
+
+    logger_->debug("SnapshotIOImpl: loaded cluster config "
+                   "({} new_nodes, {} old_nodes)",
+                   config.new_nodes_size(), config.old_nodes_size());
+
+    return config;
 }
 
 } // namespace kv::persistence

@@ -1278,24 +1278,29 @@ public:
 
     bool install_snapshot(const std::string& data,
                          uint64_t last_included_index,
-                         uint64_t last_included_term) override {
+                         uint64_t last_included_term,
+                         const std::optional<ClusterConfig>& config = {}) override {
         installed_data_ = data;
         installed_index_ = last_included_index;
         installed_term_ = last_included_term;
+        installed_config_ = config;
         install_count_++;
         return install_result_;
     }
 
     bool create_snapshot(uint64_t last_included_index,
-                        uint64_t last_included_term) override {
+                        uint64_t last_included_term,
+                        const std::optional<ClusterConfig>& config = {}) override {
         created_index_ = last_included_index;
         created_term_ = last_included_term;
+        created_config_ = config;
         create_count_++;
 
         if (create_result_) {
             // Update the data available for load_snapshot_for_sending.
             snapshot_data_.last_included_index = last_included_index;
             snapshot_data_.last_included_term = last_included_term;
+            snapshot_data_.config = config;
             // Keep existing data (or set to a default).
             if (snapshot_data_.data.empty()) {
                 snapshot_data_.data = "snapshot_data";
@@ -1305,10 +1310,17 @@ public:
         return create_result_;
     }
 
+    std::optional<ClusterConfig> load_cluster_config() override {
+        return loaded_config_;
+    }
+
     // Test configuration.
     void set_snapshot_data(SnapshotData data) { snapshot_data_ = std::move(data); }
     void set_install_result(bool result) { install_result_ = result; }
     void set_create_result(bool result) { create_result_ = result; }
+    void set_loaded_config(std::optional<ClusterConfig> config) {
+        loaded_config_ = std::move(config);
+    }
 
     // Test inspection.
     [[nodiscard]] int install_count() const { return install_count_; }
@@ -1318,6 +1330,12 @@ public:
     [[nodiscard]] uint64_t installed_term() const { return installed_term_; }
     [[nodiscard]] uint64_t created_index() const { return created_index_; }
     [[nodiscard]] uint64_t created_term() const { return created_term_; }
+    [[nodiscard]] const std::optional<ClusterConfig>& installed_config() const {
+        return installed_config_;
+    }
+    [[nodiscard]] const std::optional<ClusterConfig>& created_config() const {
+        return created_config_;
+    }
 
 private:
     SnapshotData snapshot_data_;
@@ -1327,11 +1345,16 @@ private:
     std::string installed_data_;
     uint64_t installed_index_ = 0;
     uint64_t installed_term_ = 0;
+    std::optional<ClusterConfig> installed_config_;
+
     int install_count_ = 0;
 
     uint64_t created_index_ = 0;
     uint64_t created_term_ = 0;
+    std::optional<ClusterConfig> created_config_;
     int create_count_ = 0;
+
+    std::optional<ClusterConfig> loaded_config_;
 };
 
 // Helper: create a RaftNode as leader (term 1) with the given snapshot setup.
