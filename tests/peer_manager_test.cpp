@@ -102,9 +102,10 @@ static kv::NodeConfig make_config(uint32_t node_id,
     uint32_t peer_id = 2;
     for (auto port : peer_ports) {
         kv::PeerInfo p;
-        p.id        = peer_id++;
-        p.host      = "127.0.0.1";
-        p.raft_port = port;
+        p.id          = peer_id++;
+        p.host        = "127.0.0.1";
+        p.raft_port   = port;
+        p.client_port = static_cast<uint16_t>(16000 + p.id);
         cfg.peers.push_back(p);
     }
     return cfg;

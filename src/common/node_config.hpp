@@ -14,9 +14,10 @@ namespace kv {
 // Describes a single peer node in the cluster.
 
 struct PeerInfo {
-    uint32_t    id;         // Peer node ID (must be unique, > 0)
-    std::string host;       // Peer bind host / IP
-    uint16_t    raft_port;  // Peer Raft RPC port
+    uint32_t    id;          // Peer node ID (must be unique, > 0)
+    std::string host;        // Peer bind host / IP
+    uint16_t    raft_port;   // Peer Raft RPC port
+    uint16_t    client_port; // Peer client-facing port (for REDIRECT responses)
 };
 
 // ── NodeConfig ────────────────────────────────────────────────────────────────
@@ -45,11 +46,11 @@ struct NodeConfig {
 //   - id > 0
 //   - client_port and raft_port in [1, 65535]
 //   - peers list has at least 2 entries
-//   - each peer id > 0, peer raft_port in [1, 65535]
+//   - each peer id > 0, peer raft_port and client_port in [1, 65535]
 //   - no peer has the same id as this node
 //
-// Peers format: --peers id:host:port[,id:host:port,...]
-//   Example: --peers 2:127.0.0.1:7002,3:127.0.0.1:7003
+// Peers format: --peers id:host:raft_port:client_port[,id:host:raft_port:client_port,...]
+//   Example: --peers 2:127.0.0.1:7002:6380,3:127.0.0.1:7003:6381
 
 [[nodiscard]] NodeConfig parse_config(int argc, char* argv[]);
 

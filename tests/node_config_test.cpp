@@ -30,7 +30,7 @@ protected:
         "--id", "1",
         "--client-port", "6379",
         "--raft-port",   "7001",
-        "--peers",       "2:127.0.0.1:7002,3:127.0.0.1:7003",
+        "--peers",       "2:127.0.0.1:7002:6380,3:127.0.0.1:7003:6381",
         "--data-dir",    "./data/node1",
     };
 };
@@ -57,13 +57,15 @@ TEST_F(NodeConfigTest, ParsesPeersCorrectly) {
 
     ASSERT_EQ(cfg.peers.size(), 2u);
 
-    EXPECT_EQ(cfg.peers[0].id,        2u);
-    EXPECT_EQ(cfg.peers[0].host,      "127.0.0.1");
-    EXPECT_EQ(cfg.peers[0].raft_port, 7002u);
+    EXPECT_EQ(cfg.peers[0].id,          2u);
+    EXPECT_EQ(cfg.peers[0].host,        "127.0.0.1");
+    EXPECT_EQ(cfg.peers[0].raft_port,   7002u);
+    EXPECT_EQ(cfg.peers[0].client_port, 6380u);
 
-    EXPECT_EQ(cfg.peers[1].id,        3u);
-    EXPECT_EQ(cfg.peers[1].host,      "127.0.0.1");
-    EXPECT_EQ(cfg.peers[1].raft_port, 7003u);
+    EXPECT_EQ(cfg.peers[1].id,          3u);
+    EXPECT_EQ(cfg.peers[1].host,        "127.0.0.1");
+    EXPECT_EQ(cfg.peers[1].raft_port,   7003u);
+    EXPECT_EQ(cfg.peers[1].client_port, 6381u);
 }
 
 TEST_F(NodeConfigTest, ParsesCustomHost) {
@@ -95,7 +97,7 @@ TEST_F(NodeConfigTest, ParsesThreePeers) {
     std::vector<std::string> args{
         "kv-server",
         "--id",    "1",
-        "--peers", "2:127.0.0.1:7002,3:127.0.0.1:7003,4:127.0.0.1:7004",
+        "--peers", "2:127.0.0.1:7002:6380,3:127.0.0.1:7003:6381,4:127.0.0.1:7004:6382",
         "--data-dir", "./data",
     };
     auto argv = make_argv(args);
@@ -109,7 +111,7 @@ TEST_F(NodeConfigTest, RejectsIdZero) {
     std::vector<std::string> args{
         "kv-server",
         "--id", "0",
-        "--peers", "2:127.0.0.1:7002,3:127.0.0.1:7003",
+        "--peers", "2:127.0.0.1:7002:6380,3:127.0.0.1:7003:6381",
         "--data-dir", "./data",
     };
     auto argv = make_argv(args);
@@ -120,7 +122,7 @@ TEST_F(NodeConfigTest, RejectsIdZero) {
 TEST_F(NodeConfigTest, RejectsMissingId) {
     std::vector<std::string> args{
         "kv-server",
-        "--peers", "2:127.0.0.1:7002,3:127.0.0.1:7003",
+        "--peers", "2:127.0.0.1:7002:6380,3:127.0.0.1:7003:6381",
         "--data-dir", "./data",
     };
     auto argv = make_argv(args);
@@ -143,7 +145,7 @@ TEST_F(NodeConfigTest, RejectsFewerThanTwoPeers) {
     std::vector<std::string> args{
         "kv-server",
         "--id",    "1",
-        "--peers", "2:127.0.0.1:7002",   // only 1 peer
+        "--peers", "2:127.0.0.1:7002:6380",   // only 1 peer
         "--data-dir", "./data",
     };
     auto argv = make_argv(args);
@@ -155,7 +157,7 @@ TEST_F(NodeConfigTest, RejectsPeerWithSameIdAsNode) {
     std::vector<std::string> args{
         "kv-server",
         "--id",    "1",
-        "--peers", "1:127.0.0.1:7001,2:127.0.0.1:7002",  // peer id == node id
+        "--peers", "1:127.0.0.1:7001:6379,2:127.0.0.1:7002:6380",  // peer id == node id
         "--data-dir", "./data",
     };
     auto argv = make_argv(args);
@@ -167,7 +169,7 @@ TEST_F(NodeConfigTest, RejectsDuplicatePeerIds) {
     std::vector<std::string> args{
         "kv-server",
         "--id",    "1",
-        "--peers", "2:127.0.0.1:7002,2:127.0.0.1:7003",  // id 2 duplicated
+        "--peers", "2:127.0.0.1:7002:6380,2:127.0.0.1:7003:6381",  // id 2 duplicated
         "--data-dir", "./data",
     };
     auto argv = make_argv(args);
@@ -180,7 +182,7 @@ TEST_F(NodeConfigTest, RejectsPortZeroForClientPort) {
         "kv-server",
         "--id",          "1",
         "--client-port", "0",
-        "--peers",       "2:127.0.0.1:7002,3:127.0.0.1:7003",
+        "--peers",       "2:127.0.0.1:7002:6380,3:127.0.0.1:7003:6381",
         "--data-dir",    "./data",
     };
     auto argv = make_argv(args);
@@ -193,7 +195,7 @@ TEST_F(NodeConfigTest, RejectsPortZeroForRaftPort) {
         "kv-server",
         "--id",        "1",
         "--raft-port", "0",
-        "--peers",     "2:127.0.0.1:7002,3:127.0.0.1:7003",
+        "--peers",     "2:127.0.0.1:7002:6380,3:127.0.0.1:7003:6381",
         "--data-dir",  "./data",
     };
     auto argv = make_argv(args);
@@ -205,7 +207,7 @@ TEST_F(NodeConfigTest, RejectsMalformedPeerEntry) {
     std::vector<std::string> args{
         "kv-server",
         "--id",    "1",
-        "--peers", "2-127.0.0.1-7002,3:127.0.0.1:7003",  // '-' instead of ':'
+        "--peers", "2-127.0.0.1-7002-6380,3:127.0.0.1:7003:6381",  // '-' instead of ':'
         "--data-dir", "./data",
     };
     auto argv = make_argv(args);
@@ -217,7 +219,7 @@ TEST_F(NodeConfigTest, RejectsPeerIdZero) {
     std::vector<std::string> args{
         "kv-server",
         "--id",    "1",
-        "--peers", "0:127.0.0.1:7002,3:127.0.0.1:7003",  // peer id == 0
+        "--peers", "0:127.0.0.1:7002:6380,3:127.0.0.1:7003:6381",  // peer id == 0
         "--data-dir", "./data",
     };
     auto argv = make_argv(args);
@@ -229,9 +231,33 @@ TEST_F(NodeConfigTest, RejectsSnapshotIntervalZero) {
     std::vector<std::string> args{
         "kv-server",
         "--id",                 "1",
-        "--peers",              "2:127.0.0.1:7002,3:127.0.0.1:7003",
+        "--peers",              "2:127.0.0.1:7002:6380,3:127.0.0.1:7003:6381",
         "--data-dir",           "./data",
         "--snapshot-interval",  "0",
+    };
+    auto argv = make_argv(args);
+    EXPECT_THROW(kv::parse_config(static_cast<int>(argv.size()), argv.data()),
+                 std::runtime_error);
+}
+
+TEST_F(NodeConfigTest, RejectsPeerClientPortZero) {
+    std::vector<std::string> args{
+        "kv-server",
+        "--id",    "1",
+        "--peers", "2:127.0.0.1:7002:0,3:127.0.0.1:7003:6381",  // client_port == 0
+        "--data-dir", "./data",
+    };
+    auto argv = make_argv(args);
+    EXPECT_THROW(kv::parse_config(static_cast<int>(argv.size()), argv.data()),
+                 std::runtime_error);
+}
+
+TEST_F(NodeConfigTest, RejectsPeerMissingClientPort) {
+    std::vector<std::string> args{
+        "kv-server",
+        "--id",    "1",
+        "--peers", "2:127.0.0.1:7002,3:127.0.0.1:7003:6381",  // first peer missing client_port
+        "--data-dir", "./data",
     };
     auto argv = make_argv(args);
     EXPECT_THROW(kv::parse_config(static_cast<int>(argv.size()), argv.data()),

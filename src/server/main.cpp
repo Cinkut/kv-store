@@ -29,7 +29,8 @@ int main(int argc, char* argv[]) {
         cfg.peers.size());
 
     for (const auto& peer : cfg.peers) {
-        logger->debug("  peer id={} host={} raft_port={}", peer.id, peer.host, peer.raft_port);
+        logger->debug("  peer id={} host={} raft_port={} client_port={}",
+            peer.id, peer.host, peer.raft_port, peer.client_port);
     }
 
     // ── Storage + Network ─────────────────────────────────────────────────────

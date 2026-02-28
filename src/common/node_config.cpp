@@ -41,7 +41,7 @@ void validate_port(uint16_t port, std::string_view field_name) {
 }
 
 // Parse the --peers string into a vector of PeerInfo.
-// Format: id:host:port[,id:host:port,...]
+// Format: id:host:raft_port:client_port[,id:host:raft_port:client_port,...]
 [[nodiscard]] std::vector<PeerInfo> parse_peers(const std::string& peers_str) {
     if (peers_str.empty()) {
         return {};
@@ -64,33 +64,52 @@ void validate_port(uint16_t port, std::string_view field_name) {
             remaining = remaining.substr(comma_pos + 1);
         }
 
-        // Split entry by ':'  → id : host : port
-        // host may itself contain '.' but not ':', so split on first and last ':'.
+        // Split entry by ':'  → id : host : raft_port : client_port
+        // We need exactly 4 colon-separated fields.
+        // host may contain '.' but not ':', so find colons by position.
         auto first_colon = entry.find(':');
         if (first_colon == std::string_view::npos) {
             throw std::runtime_error(
-                std::format("Malformed peer entry (expected id:host:port): '{}'", entry));
-        }
-        auto last_colon = entry.rfind(':');
-        if (last_colon == first_colon) {
-            throw std::runtime_error(
-                std::format("Malformed peer entry (expected id:host:port): '{}'", entry));
+                std::format("Malformed peer entry (expected id:host:raft_port:client_port): '{}'", entry));
         }
 
-        std::string_view id_sv   = entry.substr(0, first_colon);
-        std::string_view host_sv = entry.substr(first_colon + 1, last_colon - first_colon - 1);
-        std::string_view port_sv = entry.substr(last_colon + 1);
+        // Find second colon (after host)
+        auto second_colon = entry.find(':', first_colon + 1);
+        if (second_colon == std::string_view::npos) {
+            throw std::runtime_error(
+                std::format("Malformed peer entry (expected id:host:raft_port:client_port): '{}'", entry));
+        }
+
+        // Find third colon (after raft_port)
+        auto third_colon = entry.find(':', second_colon + 1);
+        if (third_colon == std::string_view::npos) {
+            throw std::runtime_error(
+                std::format("Malformed peer entry (expected id:host:raft_port:client_port): '{}'", entry));
+        }
+
+        // Ensure no extra colons
+        if (entry.find(':', third_colon + 1) != std::string_view::npos) {
+            throw std::runtime_error(
+                std::format("Malformed peer entry (too many fields): '{}'", entry));
+        }
+
+        std::string_view id_sv          = entry.substr(0, first_colon);
+        std::string_view host_sv        = entry.substr(first_colon + 1, second_colon - first_colon - 1);
+        std::string_view raft_port_sv   = entry.substr(second_colon + 1, third_colon - second_colon - 1);
+        std::string_view client_port_sv = entry.substr(third_colon + 1);
 
         PeerInfo peer;
-        peer.id        = parse_uint<uint32_t>(id_sv,   "peer id");
-        peer.host      = std::string(host_sv);
-        peer.raft_port = parse_uint<uint16_t>(port_sv, "peer raft_port");
+        peer.id          = parse_uint<uint32_t>(id_sv,          "peer id");
+        peer.host        = std::string(host_sv);
+        peer.raft_port   = parse_uint<uint16_t>(raft_port_sv,   "peer raft_port");
+        peer.client_port = parse_uint<uint16_t>(client_port_sv, "peer client_port");
 
         if (peer.id == 0) {
             throw std::runtime_error(
                 std::format("Peer id must be > 0, got 0 in entry '{}'", entry));
         }
-        validate_port(peer.raft_port, "peer raft_port");
+        validate_port(peer.raft_port,   "peer raft_port");
+        validate_port(peer.client_port, "peer client_port");
 
         if (peer.host.empty()) {
             throw std::runtime_error(
@@ -165,7 +184,7 @@ void add_options(po::options_description& desc) {
             "Port for Raft RPC connections")
         ("peers",
             po::value<std::string>()->required(),
-            "Comma-separated peer list: id:host:raft_port[,...]")
+            "Comma-separated peer list: id:host:raft_port:client_port[,...]")
         ("data-dir",
             po::value<std::string>()->default_value("./data"),
             "Directory for WAL and snapshot files")

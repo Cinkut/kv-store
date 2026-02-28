@@ -241,7 +241,7 @@ kv-server
     --host <string>                 Bind address (default: 0.0.0.0)
     --client-port <uint16>          Port for client connections (default: 6379)
     --raft-port <uint16>            Port for Raft RPC connections (default: 7001)
-    --peers <id:host:port,...>      Comma-separated peer list
+    --peers <id:host:raft_port:client_port,...>  Comma-separated peer list
     --data-dir <path>               Directory for WAL + snapshots (default: ./data)
     --snapshot-interval <uint32>    Entries between snapshots (default: 1000)
     --log-level <string>            trace|debug|info|warn|error|critical (default: info)
@@ -252,17 +252,17 @@ Example: 3-node local cluster
 ```bash
 # Terminal 1
 kv-server --id 1 --client-port 6379 --raft-port 7001 \
-          --peers 2:127.0.0.1:7002,3:127.0.0.1:7003 \
+          --peers 2:127.0.0.1:7002:6380,3:127.0.0.1:7003:6381 \
           --data-dir ./data/node1
 
 # Terminal 2
 kv-server --id 2 --client-port 6380 --raft-port 7002 \
-          --peers 1:127.0.0.1:7001,3:127.0.0.1:7003 \
+          --peers 1:127.0.0.1:7001:6379,3:127.0.0.1:7003:6381 \
           --data-dir ./data/node2
 
 # Terminal 3
 kv-server --id 3 --client-port 6381 --raft-port 7003 \
-          --peers 1:127.0.0.1:7001,2:127.0.0.1:7002 \
+          --peers 1:127.0.0.1:7001:6379,2:127.0.0.1:7002:6380 \
           --data-dir ./data/node3
 ```
 
