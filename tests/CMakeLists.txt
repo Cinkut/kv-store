@@ -8,6 +8,7 @@ add_executable(kvstore_tests
     raft_test.cpp
     redirect_test.cpp
     wal_test.cpp
+    snapshot_test.cpp
 )
 target_link_libraries(kvstore_tests
     PRIVATE
