@@ -23,7 +23,8 @@ RaftNode::RaftNode(asio::io_context& ioc,
                    SnapshotIO* snapshot_io,
                    uint64_t snapshot_interval,
                    PersistCallback* persist_cb,
-                   Clock* clock)
+                   Clock* clock,
+                   ConfigChangeCallback on_config_change)
     : strand_(asio::make_strand(ioc))
     , node_id_(node_id)
     , config_(node_id, std::move(peer_ids))
@@ -34,6 +35,7 @@ RaftNode::RaftNode(asio::io_context& ioc,
     , snapshot_io_(snapshot_io)
     , snapshot_interval_(snapshot_interval)
     , persist_cb_(persist_cb)
+    , on_config_change_(std::move(on_config_change))
     , clock_(clock ? clock : &default_clock_)
 {
     config_.init_from_peer_ids(node_id_, config_.peer_ids());
@@ -475,6 +477,145 @@ bool RaftNode::submit(Command cmd) {
     return true;
 }
 
+bool RaftNode::submit_config_change(std::vector<NodeInfo> new_nodes) {
+    if (state_ != NodeState::Leader) {
+        return false;
+    }
+
+    // Only one config change at a time (Raft §6).
+    if (config_change_pending_) {
+        logger_->warn("[term={}] Config change rejected: another change is in progress",
+                      current_term_);
+        return false;
+    }
+
+    // Don't allow config changes while in joint consensus.
+    if (config_.is_joint()) {
+        logger_->warn("[term={}] Config change rejected: already in joint consensus",
+                      current_term_);
+        return false;
+    }
+
+    // Build joint consensus config: C_old,new.
+    // C_old = current stable config (nodes_).
+    // C_new = new_nodes.
+    ClusterConfig config_proto;
+    for (const auto& node : config_.nodes()) {
+        *config_proto.add_old_nodes() = node;
+    }
+    for (const auto& node : new_nodes) {
+        *config_proto.add_new_nodes() = node;
+    }
+
+    // Create the log entry.
+    Command cmd;
+    cmd.set_type(CMD_CONFIG);
+    LogEntry entry;
+    entry.set_term(current_term_);
+    entry.set_index(log_.last_index() + 1);
+    *entry.mutable_command() = std::move(cmd);
+    *entry.mutable_config() = std::move(config_proto);
+
+    // WAL-before-memory.
+    if (persist_cb_) {
+        persist_cb_->persist_entry(entry);
+    }
+
+    log_.append(std::move(entry));
+    config_change_pending_ = true;
+
+    logger_->info("[term={}] Config change started (joint consensus) at index {}",
+                  current_term_, log_.last_index());
+
+    // Apply the config change immediately to this node (leader applies
+    // config entries as soon as they are appended, per Raft §6).
+    // This ensures the leader uses the joint quorum for this entry's commit.
+    const auto* appended = log_.entry_at(log_.last_index());
+    if (appended) {
+        apply_config_entry(*appended);
+    }
+
+    // Trigger replication to all peers (including any new ones in the config).
+    asio::co_spawn(strand_, send_append_entries_to_all(), asio::detached);
+
+    return true;
+}
+
+// ── Config change helpers ────────────────────────────────────────────────────
+
+void RaftNode::apply_config_entry(const LogEntry& entry) {
+    if (!entry.has_config()) return;
+
+    const auto& cfg = entry.config();
+
+    if (cfg.old_nodes_size() > 0) {
+        // Joint consensus entry (C_old,new): enter joint phase.
+        config_ = ClusterConfiguration(node_id_, cfg);
+
+        logger_->info("[term={}] Applied joint consensus config (C_old,new) "
+                      "at index {} — new_nodes={}, old_nodes={}",
+                      current_term_, entry.index(),
+                      cfg.new_nodes_size(), cfg.old_nodes_size());
+    } else {
+        // Stable config entry (C_new): finalize.
+        config_ = ClusterConfiguration(node_id_, cfg);
+        config_change_pending_ = false;
+
+        logger_->info("[term={}] Applied stable config (C_new) at index {} — nodes={}",
+                      current_term_, entry.index(), cfg.new_nodes_size());
+    }
+
+    // Initialize leader tracking state for any new peers.
+    if (state_ == NodeState::Leader) {
+        for (uint32_t peer : config_.peer_ids()) {
+            if (next_index_.find(peer) == next_index_.end()) {
+                next_index_[peer] = log_.last_index() + 1;
+                match_index_[peer] = 0;
+            }
+        }
+    }
+
+    // Notify the server layer (e.g., to add/remove PeerClient connections).
+    if (on_config_change_) {
+        on_config_change_(config_, entry);
+    }
+}
+
+void RaftNode::maybe_finalize_config_change() {
+    // Only leader finalizes, and only when in joint consensus.
+    if (state_ != NodeState::Leader) return;
+    if (!config_.is_joint()) return;
+
+    // The joint entry has been committed. Now append the stable C_new entry.
+    ClusterConfig stable_cfg = config_.to_stable_proto();
+
+    Command cmd;
+    cmd.set_type(CMD_CONFIG);
+    LogEntry entry;
+    entry.set_term(current_term_);
+    entry.set_index(log_.last_index() + 1);
+    *entry.mutable_command() = std::move(cmd);
+    *entry.mutable_config() = std::move(stable_cfg);
+
+    if (persist_cb_) {
+        persist_cb_->persist_entry(entry);
+    }
+
+    log_.append(std::move(entry));
+
+    logger_->info("[term={}] Appended finalize config entry (C_new) at index {}",
+                  current_term_, log_.last_index());
+
+    // Apply immediately on the leader.
+    const auto* appended = log_.entry_at(log_.last_index());
+    if (appended) {
+        apply_config_entry(*appended);
+    }
+
+    // Trigger replication.
+    asio::co_spawn(strand_, send_append_entries_to_all(), asio::detached);
+}
+
 // ── State transitions ────────────────────────────────────────────────────────
 
 void RaftNode::become_follower(uint64_t term) {
@@ -519,7 +660,7 @@ void RaftNode::become_leader() {
     // Initialize nextIndex and matchIndex (Raft §5.3).
     next_index_.clear();
     match_index_.clear();
-    for (uint32_t peer : config_.peer_ids()) {
+    for (uint32_t peer : config_.all_peer_ids()) {
         next_index_[peer] = log_.last_index() + 1;
         match_index_[peer] = 0;
     }
@@ -642,7 +783,9 @@ asio::awaitable<void> RaftNode::request_vote_from(uint32_t peer_id) {
 asio::awaitable<void> RaftNode::send_append_entries_to_all() {
     if (state_ != NodeState::Leader) co_return;
 
-    for (uint32_t peer : config_.peer_ids()) {
+    // During joint consensus, send to all peers in both configs.
+    auto peers = config_.all_peer_ids();
+    for (uint32_t peer : peers) {
         asio::co_spawn(strand_, send_append_entries_to(peer), asio::detached);
     }
 }
@@ -731,7 +874,7 @@ void RaftNode::try_advance_commit() {
         // Build voter set: self + peers whose matchIndex >= N.
         std::set<uint32_t> voters;
         voters.insert(node_id_);  // self
-        for (uint32_t peer : config_.peer_ids()) {
+        for (uint32_t peer : config_.all_peer_ids()) {
             if (match_index_[peer] >= n) voters.insert(peer);
         }
 
@@ -748,7 +891,20 @@ void RaftNode::apply_committed_entries() {
     while (last_applied_ < commit_index_) {
         last_applied_++;
         const auto* entry = log_.entry_at(last_applied_);
-        if (entry && on_apply_) {
+        if (!entry) continue;
+
+        if (entry->command().type() == CMD_CONFIG) {
+            // Config entries on followers: apply config when committed.
+            // On leader, config was already applied when appended.
+            if (state_ != NodeState::Leader) {
+                apply_config_entry(*entry);
+            }
+            // If this was a joint consensus entry and we're leader,
+            // now that it's committed, finalize the transition.
+            if (config_.is_joint()) {
+                maybe_finalize_config_change();
+            }
+        } else if (on_apply_) {
             on_apply_(*entry);
         }
     }
@@ -814,7 +970,7 @@ void RaftNode::try_renew_lease() {
     // Build voter set: self + peers whose last ack is within the lease window.
     std::set<uint32_t> recent_voters;
     recent_voters.insert(node_id_);  // self always counts
-    for (uint32_t peer : config_.peer_ids()) {
+    for (uint32_t peer : config_.all_peer_ids()) {
         auto it = last_ack_time_.find(peer);
         if (it != last_ack_time_.end() &&
             (now - it->second) <= kLeaseDuration) {

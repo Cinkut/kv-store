@@ -135,6 +135,13 @@ public:
     // to the state machine.
     using ApplyCallback = std::function<void(const LogEntry&)>;
 
+    // Callback invoked when a cluster configuration change is applied.
+    // The callback receives the new ClusterConfiguration and the log entry
+    // that triggered the change.  The server layer uses this to add/remove
+    // PeerClient connections and update transport receive loops.
+    using ConfigChangeCallback = std::function<void(const ClusterConfiguration&,
+                                                     const LogEntry&)>;
+
     // Constructor.
     //   ioc          – io_context (strand will be created from its executor)
     //   node_id      – this node's ID
@@ -147,6 +154,7 @@ public:
     //   snapshot_interval – entries applied between snapshots (0 = no auto-snapshot)
     //   persist_cb   – WAL persistence callback (optional; null disables WAL writes)
     //   clock        – time source for read leases (optional; null uses SteadyClock)
+    //   on_config_change – callback for applied config changes (optional)
     RaftNode(boost::asio::io_context& ioc,
              uint32_t node_id,
              std::vector<uint32_t> peer_ids,
@@ -157,7 +165,8 @@ public:
              SnapshotIO* snapshot_io = nullptr,
              uint64_t snapshot_interval = 0,
              PersistCallback* persist_cb = nullptr,
-             Clock* clock = nullptr);
+             Clock* clock = nullptr,
+             ConfigChangeCallback on_config_change = {});
 
     ~RaftNode() = default;
 
@@ -211,6 +220,14 @@ public:
     // Returns true if the command was appended to the log.
     // The on_apply callback will be invoked when it is committed.
     [[nodiscard]] bool submit(Command cmd);
+
+    // Submit a cluster configuration change.  Only succeeds if this node is
+    // Leader and no other config change is in progress (one at a time per Raft).
+    // `new_nodes` is the desired final cluster membership.
+    // Appends a joint-consensus entry (C_old,new) to the log.
+    // Once committed, the leader will automatically append a finalize entry (C_new).
+    // Returns true if the config change was started.
+    [[nodiscard]] bool submit_config_change(std::vector<NodeInfo> new_nodes);
 
     // ── State restoration (call BEFORE start()) ────────────────────────────
 
@@ -294,6 +311,13 @@ private:
     // Check if we should create a snapshot and do so if needed.
     void maybe_trigger_snapshot();
 
+    // Apply a committed config entry: update config_, initialize tracking
+    // for new peers, and invoke the on_config_change_ callback.
+    void apply_config_entry(const LogEntry& entry);
+
+    // After a joint consensus entry is committed, append the finalize entry.
+    void maybe_finalize_config_change();
+
     // ── Read lease ───────────────────────────────────────────────────────────
 
     // Check if a majority of peers have acked recently enough to hold a lease.
@@ -325,6 +349,7 @@ private:
     SnapshotIO* snapshot_io_;        // optional; null = no snapshot support
     uint64_t snapshot_interval_;     // 0 = no auto-snapshot
     PersistCallback* persist_cb_;    // optional; null = no WAL persistence
+    ConfigChangeCallback on_config_change_;  // optional; null = no config change notifications
 
     // Persistent state (Raft §5.2).
     uint64_t current_term_ = 0;
@@ -357,6 +382,9 @@ private:
 
     // Shutdown flag.
     bool stopped_ = false;
+
+    // Config change tracking: only one config change at a time.
+    bool config_change_pending_ = false;
 
     // ── Read lease state ─────────────────────────────────────────────────────
 
