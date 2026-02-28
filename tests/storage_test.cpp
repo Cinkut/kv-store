@@ -1,4 +1,5 @@
 #include "storage/storage.hpp"
+#include "storage/storage_engine.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -11,10 +12,13 @@
 namespace kv {
 
 // ── Fixture ───────────────────────────────────────────────────────────────────
+// Uses MemoryStorage (via the Storage alias).
+// The StorageEngine interface tests in 7.3.7 will run this suite against
+// all backend implementations.
 
 class StorageTest : public ::testing::Test {
 protected:
-    Storage storage_;
+    MemoryStorage storage_;
 };
 
 // ── get() ─────────────────────────────────────────────────────────────────────
