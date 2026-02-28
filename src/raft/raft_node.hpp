@@ -98,6 +98,23 @@ public:
                                 uint64_t last_included_term) = 0;
 };
 
+// ── PersistCallback abstraction ──────────────────────────────────────────────
+//
+// Called by RaftNode BEFORE updating in-memory state to ensure
+// WAL-before-memory ordering.  Production code writes to WAL;
+// tests inject a no-op or recording mock.
+
+class PersistCallback {
+public:
+    virtual ~PersistCallback() = default;
+
+    // Persist term and votedFor before updating in-memory state.
+    virtual void persist_metadata(uint64_t term, int32_t voted_for) = 0;
+
+    // Persist a single log entry before updating in-memory state.
+    virtual void persist_entry(const LogEntry& entry) = 0;
+};
+
 // ── RaftNode ─────────────────────────────────────────────────────────────────
 //
 // Core Raft consensus state machine.
@@ -126,6 +143,7 @@ public:
     //   on_apply     – callback for committed entries
     //   snapshot_io  – snapshot persistence (optional; null disables snapshot)
     //   snapshot_interval – entries applied between snapshots (0 = no auto-snapshot)
+    //   persist_cb   – WAL persistence callback (optional; null disables WAL writes)
     RaftNode(boost::asio::io_context& ioc,
              uint32_t node_id,
              std::vector<uint32_t> peer_ids,
@@ -134,7 +152,8 @@ public:
              std::shared_ptr<spdlog::logger> logger,
              ApplyCallback on_apply = {},
              SnapshotIO* snapshot_io = nullptr,
-             uint64_t snapshot_interval = 0);
+             uint64_t snapshot_interval = 0,
+             PersistCallback* persist_cb = nullptr);
 
     ~RaftNode() = default;
 
@@ -276,6 +295,7 @@ private:
     ApplyCallback on_apply_;
     SnapshotIO* snapshot_io_;        // optional; null = no snapshot support
     uint64_t snapshot_interval_;     // 0 = no auto-snapshot
+    PersistCallback* persist_cb_;    // optional; null = no WAL persistence
 
     // Persistent state (Raft §5.2).
     uint64_t current_term_ = 0;

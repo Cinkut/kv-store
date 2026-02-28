@@ -20,7 +20,8 @@ RaftNode::RaftNode(asio::io_context& ioc,
                    std::shared_ptr<spdlog::logger> logger,
                    ApplyCallback on_apply,
                    SnapshotIO* snapshot_io,
-                   uint64_t snapshot_interval)
+                   uint64_t snapshot_interval,
+                   PersistCallback* persist_cb)
     : strand_(asio::make_strand(ioc))
     , node_id_(node_id)
     , peer_ids_(std::move(peer_ids))
@@ -30,6 +31,7 @@ RaftNode::RaftNode(asio::io_context& ioc,
     , on_apply_(std::move(on_apply))
     , snapshot_io_(snapshot_io)
     , snapshot_interval_(snapshot_interval)
+    , persist_cb_(persist_cb)
 {
 }
 
@@ -99,6 +101,11 @@ RaftNode::handle_request_vote(const RequestVoteRequest& req) {
     }
 
     // Grant vote.
+    // WAL-before-memory: persist votedFor before updating in-memory state.
+    if (persist_cb_) {
+        persist_cb_->persist_metadata(current_term_,
+                                      static_cast<int32_t>(req.candidate_id()));
+    }
     voted_for_ = req.candidate_id();
     resp.set_vote_granted(true);
     reset_election_timer();
@@ -146,6 +153,13 @@ RaftNode::handle_append_entries(const AppendEntriesRequest& req) {
                        "(prevLogIndex={}, prevLogTerm={})",
                        current_term_, req.prev_log_index(), req.prev_log_term());
         co_return resp;
+    }
+
+    // Persist new entries to WAL.
+    if (persist_cb_) {
+        for (const auto& entry : entries) {
+            persist_cb_->persist_entry(entry);
+        }
     }
 
     resp.set_success(true);
@@ -390,6 +404,11 @@ bool RaftNode::submit(Command cmd) {
     entry.set_index(log_.last_index() + 1);
     *entry.mutable_command() = std::move(cmd);
 
+    // WAL-before-memory: persist log entry before appending to in-memory log.
+    if (persist_cb_) {
+        persist_cb_->persist_entry(entry);
+    }
+
     log_.append(std::move(entry));
     logger_->debug("[term={}] Appended entry at index {}", current_term_, log_.last_index());
 
@@ -403,6 +422,12 @@ bool RaftNode::submit(Command cmd) {
 
 void RaftNode::become_follower(uint64_t term) {
     NodeState prev = state_;
+
+    // WAL-before-memory: persist term/votedFor before updating in-memory state.
+    if (persist_cb_ && (term != current_term_ || voted_for_.has_value())) {
+        persist_cb_->persist_metadata(term, -1);
+    }
+
     state_ = NodeState::Follower;
     current_term_ = term;
     voted_for_ = std::nullopt;
@@ -445,6 +470,12 @@ void RaftNode::become_leader() {
     entry.set_term(current_term_);
     entry.set_index(log_.last_index() + 1);
     *entry.mutable_command() = std::move(noop);
+
+    // WAL-before-memory: persist no-op entry before appending to in-memory log.
+    if (persist_cb_) {
+        persist_cb_->persist_entry(entry);
+    }
+
     log_.append(std::move(entry));
 
     // Cancel election timer, start heartbeat timer.
@@ -488,7 +519,14 @@ asio::awaitable<void> RaftNode::heartbeat_timer_loop() {
 
 asio::awaitable<void> RaftNode::start_election() {
     // Increment term, vote for self.
-    current_term_++;
+    uint64_t new_term = current_term_ + 1;
+
+    // WAL-before-memory: persist new term + self-vote before updating in-memory.
+    if (persist_cb_) {
+        persist_cb_->persist_metadata(new_term, static_cast<int32_t>(node_id_));
+    }
+
+    current_term_ = new_term;
     voted_for_ = node_id_;
     votes_received_ = 1;  // Self-vote.
     leader_id_ = std::nullopt;

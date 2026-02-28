@@ -2061,3 +2061,200 @@ TEST_F(RaftNodeTest, NoSnapshotWithoutSnapshotIO) {
     node.stop();
     pump(ioc_);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//  PersistCallback tests
+// ════════════════════════════════════════════════════════════════════════════
+
+// Recording mock that tracks all persist_metadata / persist_entry calls.
+class RecordingPersistCallback : public PersistCallback {
+public:
+    struct MetadataRecord {
+        uint64_t term;
+        int32_t voted_for;
+    };
+
+    void persist_metadata(uint64_t term, int32_t voted_for) override {
+        metadata_calls_.push_back({term, voted_for});
+    }
+
+    void persist_entry(const LogEntry& entry) override {
+        entry_calls_.push_back(entry);
+    }
+
+    [[nodiscard]] const std::vector<MetadataRecord>& metadata_calls() const {
+        return metadata_calls_;
+    }
+    [[nodiscard]] const std::vector<LogEntry>& entry_calls() const {
+        return entry_calls_;
+    }
+
+    void clear() {
+        metadata_calls_.clear();
+        entry_calls_.clear();
+    }
+
+private:
+    std::vector<MetadataRecord> metadata_calls_;
+    std::vector<LogEntry> entry_calls_;
+};
+
+TEST_F(RaftNodeTest, PersistCallbackOnElection) {
+    RecordingPersistCallback persist;
+    RaftNode node(ioc_, 1, {2, 3}, transport_, timer_factory_, logger_,
+                  {}, nullptr, 0, &persist);
+    node.start();
+    pump(ioc_);
+
+    // Trigger election timeout.
+    auto* election_timer = timer_factory_.timer(0);
+    election_timer->fire();
+    pump(ioc_);
+
+    // start_election() should persist metadata(term=1, votedFor=1).
+    ASSERT_GE(persist.metadata_calls().size(), 1u);
+    EXPECT_EQ(persist.metadata_calls().back().term, 1u);
+    EXPECT_EQ(persist.metadata_calls().back().voted_for, 1);
+
+    node.stop();
+    pump(ioc_);
+}
+
+TEST_F(RaftNodeTest, PersistCallbackOnVoteGrant) {
+    RecordingPersistCallback persist;
+    RaftNode node(ioc_, 1, {2, 3}, transport_, timer_factory_, logger_,
+                  {}, nullptr, 0, &persist);
+    node.start();
+    pump(ioc_);
+
+    persist.clear();
+
+    RequestVoteRequest req;
+    req.set_term(1);
+    req.set_candidate_id(2);
+    req.set_last_log_index(0);
+    req.set_last_log_term(0);
+
+    boost::asio::co_spawn(ioc_, [&]() -> boost::asio::awaitable<void> {
+        auto resp = co_await node.handle_request_vote(req);
+        EXPECT_TRUE(resp.vote_granted());
+    }, boost::asio::detached);
+    pump(ioc_);
+
+    // Should have persisted: first become_follower(1) → metadata(1, -1),
+    // then vote grant → metadata(1, 2).
+    ASSERT_GE(persist.metadata_calls().size(), 1u);
+    auto& last = persist.metadata_calls().back();
+    EXPECT_EQ(last.term, 1u);
+    EXPECT_EQ(last.voted_for, 2);
+
+    node.stop();
+    pump(ioc_);
+}
+
+TEST_F(RaftNodeTest, PersistCallbackOnSubmit) {
+    RecordingPersistCallback persist;
+    RaftNode node(ioc_, 1, {2, 3}, transport_, timer_factory_, logger_,
+                  {}, nullptr, 0, &persist);
+    node.start();
+    pump(ioc_);
+
+    // Win election.
+    auto* et = timer_factory_.timer(0);
+    et->fire();
+    pump(ioc_);
+
+    RequestVoteResponse vresp;
+    vresp.set_term(1);
+    vresp.set_vote_granted(true);
+    node.handle_vote_response(2, vresp);
+    pump(ioc_);
+
+    persist.clear();
+
+    // Submit a command.
+    Command cmd;
+    cmd.set_type(CMD_SET);
+    cmd.set_key("foo");
+    cmd.set_value("bar");
+    ASSERT_TRUE(node.submit(std::move(cmd)));
+    pump(ioc_);
+
+    // Should have persisted the log entry.
+    ASSERT_EQ(persist.entry_calls().size(), 1u);
+    EXPECT_EQ(persist.entry_calls()[0].command().key(), "foo");
+    EXPECT_EQ(persist.entry_calls()[0].command().value(), "bar");
+
+    node.stop();
+    pump(ioc_);
+}
+
+TEST_F(RaftNodeTest, PersistCallbackOnBecomeLeaderNoOp) {
+    RecordingPersistCallback persist;
+    RaftNode node(ioc_, 1, {2, 3}, transport_, timer_factory_, logger_,
+                  {}, nullptr, 0, &persist);
+    node.start();
+    pump(ioc_);
+
+    // Trigger election.
+    auto* et = timer_factory_.timer(0);
+    et->fire();
+    pump(ioc_);
+
+    persist.clear();
+
+    // Win election — become_leader appends a no-op entry.
+    RequestVoteResponse vresp;
+    vresp.set_term(1);
+    vresp.set_vote_granted(true);
+    node.handle_vote_response(2, vresp);
+    pump(ioc_);
+
+    // Should have persisted the no-op entry.
+    ASSERT_GE(persist.entry_calls().size(), 1u);
+    EXPECT_EQ(persist.entry_calls()[0].command().type(), CMD_NOOP);
+
+    node.stop();
+    pump(ioc_);
+}
+
+TEST_F(RaftNodeTest, PersistCallbackOnAppendEntries) {
+    RecordingPersistCallback persist;
+    RaftNode node(ioc_, 1, {2, 3}, transport_, timer_factory_, logger_,
+                  {}, nullptr, 0, &persist);
+    node.start();
+    pump(ioc_);
+
+    persist.clear();
+
+    AppendEntriesRequest req;
+    req.set_term(1);
+    req.set_leader_id(2);
+    req.set_prev_log_index(0);
+    req.set_prev_log_term(0);
+    req.set_leader_commit(0);
+
+    auto* e = req.add_entries();
+    e->set_term(1);
+    e->set_index(1);
+    auto* cmd = e->mutable_command();
+    cmd->set_type(CMD_SET);
+    cmd->set_key("k1");
+    cmd->set_value("v1");
+
+    bool success = false;
+    boost::asio::co_spawn(ioc_, [&]() -> boost::asio::awaitable<void> {
+        auto resp = co_await node.handle_append_entries(req);
+        success = resp.success();
+    }, boost::asio::detached);
+    pump(ioc_);
+
+    EXPECT_TRUE(success);
+
+    // Should have persisted: metadata for become_follower(1), then the entry.
+    ASSERT_GE(persist.entry_calls().size(), 1u);
+    EXPECT_EQ(persist.entry_calls().back().command().key(), "k1");
+
+    node.stop();
+    pump(ioc_);
+}
