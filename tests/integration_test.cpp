@@ -5,6 +5,7 @@
 // The port is bound before the server thread starts; all sync socket ops use
 // a short deadline so the suite never hangs indefinitely.
 
+#include "network/binary_protocol.hpp"
 #include "network/server.hpp"
 #include "storage/storage.hpp"
 
@@ -12,15 +13,19 @@
 
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/read.hpp>
 #include <boost/asio/read_until.hpp>
 #include <boost/asio/streambuf.hpp>
 #include <boost/asio/write.hpp>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <istream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -35,9 +40,9 @@ constexpr const char*   TEST_HOST = "127.0.0.1";
 // ---------------------------------------------------------------------------
 class SyncClient {
 public:
-    SyncClient() : ioc_(1), socket_(ioc_) {
+    explicit SyncClient(std::uint16_t port = TEST_PORT) : ioc_(1), socket_(ioc_) {
         tcp::resolver resolver{ioc_};
-        auto endpoints = resolver.resolve(TEST_HOST, std::to_string(TEST_PORT));
+        auto endpoints = resolver.resolve(TEST_HOST, std::to_string(port));
         boost::asio::connect(socket_, endpoints);
     }
 
@@ -192,6 +197,286 @@ TEST_F(IntegrationTest, PipelineMultipleCommands) {
     EXPECT_EQ(client.recv_line(), "VALUE aaa");
     EXPECT_EQ(client.recv_line(), "VALUE bbb");
     EXPECT_EQ(client.recv_line(), "PONG");
+}
+
+// ===========================================================================
+// Binary protocol integration tests
+// ===========================================================================
+
+using namespace kv;
+using namespace kv::network;
+
+constexpr std::uint16_t BINARY_TEST_PORT = 17380;
+
+// ---------------------------------------------------------------------------
+// Synchronous TCP client that speaks the binary protocol.
+// Uses serialize_binary_request() to frame commands and
+// parse_binary_response() to decode responses — exercising the full
+// TCP → Session auto-detect → binary parse → dispatch → serialize → TCP path.
+// ---------------------------------------------------------------------------
+class BinarySyncClient {
+public:
+    BinarySyncClient() : ioc_(1), socket_(ioc_) {
+        tcp::resolver resolver{ioc_};
+        auto endpoints = resolver.resolve(TEST_HOST, std::to_string(BINARY_TEST_PORT));
+        boost::asio::connect(socket_, endpoints);
+    }
+
+    // Send a binary-framed request for the given Command.
+    void send(const Command& cmd) {
+        auto wire = serialize_binary_request(cmd);
+        boost::asio::write(socket_, boost::asio::buffer(wire));
+    }
+
+    // Read one binary-framed response and return the parsed Response.
+    Response recv() {
+        // Read the 5-byte header.
+        std::vector<uint8_t> header(binary::kHeaderSize);
+        boost::asio::read(socket_, boost::asio::buffer(header));
+
+        uint8_t status = 0;
+        uint32_t payload_len = 0;
+        EXPECT_TRUE(read_binary_header(header, status, payload_len));
+
+        // Read the payload.
+        std::vector<uint8_t> payload(payload_len);
+        if (payload_len > 0) {
+            boost::asio::read(socket_, boost::asio::buffer(payload));
+        }
+
+        auto result = parse_binary_response(status, payload);
+        // If parsing itself produced an outer ErrorResp, wrap it.
+        if (std::holds_alternative<ErrorResp>(result)) {
+            return std::get<ErrorResp>(result);
+        }
+        return std::get<Response>(result);
+    }
+
+    // Convenience: send + recv in one call.
+    Response cmd(const Command& c) {
+        send(c);
+        return recv();
+    }
+
+    // Send raw bytes (for malformed-message tests).
+    void send_raw(const std::vector<uint8_t>& data) {
+        boost::asio::write(socket_, boost::asio::buffer(data));
+    }
+
+private:
+    io_ctx      ioc_;
+    tcp::socket socket_;
+};
+
+// ---------------------------------------------------------------------------
+// Test fixture: manages server lifetime on a different port to avoid
+// conflicts with the text-protocol fixture running in the same process.
+// ---------------------------------------------------------------------------
+
+class BinaryIntegrationTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        server_ = std::make_unique<kv::network::Server>(
+            TEST_HOST, BINARY_TEST_PORT, storage_);
+        server_thread_ = std::thread([this] { server_->run(); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    void TearDown() override {
+        server_->stop();
+        if (server_thread_.joinable()) {
+            server_thread_.join();
+        }
+    }
+
+    kv::Storage storage_;
+    std::unique_ptr<kv::network::Server> server_;
+    std::thread server_thread_;
+};
+
+// ---------------------------------------------------------------------------
+// Response type assertions (helpers).
+// ---------------------------------------------------------------------------
+
+template <typename T>
+bool holds(const Response& r) {
+    return std::holds_alternative<T>(r);
+}
+
+template <typename T>
+const T& get(const Response& r) {
+    return std::get<T>(r);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+TEST_F(BinaryIntegrationTest, Ping) {
+    BinarySyncClient client;
+    auto resp = client.cmd(PingCmd{});
+    EXPECT_TRUE(holds<PongResp>(resp));
+}
+
+TEST_F(BinaryIntegrationTest, SetAndGet) {
+    BinarySyncClient client;
+
+    auto set_resp = client.cmd(SetCmd{"hello", "world"});
+    ASSERT_TRUE(holds<OkResp>(set_resp));
+
+    auto get_resp = client.cmd(GetCmd{"hello"});
+    ASSERT_TRUE(holds<ValueResp>(get_resp));
+    EXPECT_EQ(get<ValueResp>(get_resp).value, "world");
+}
+
+TEST_F(BinaryIntegrationTest, GetNotFound) {
+    BinarySyncClient client;
+    auto resp = client.cmd(GetCmd{"nonexistent"});
+    EXPECT_TRUE(holds<NotFoundResp>(resp));
+}
+
+TEST_F(BinaryIntegrationTest, Overwrite) {
+    BinarySyncClient client;
+    EXPECT_TRUE(holds<OkResp>(client.cmd(SetCmd{"k", "v1"})));
+    EXPECT_TRUE(holds<OkResp>(client.cmd(SetCmd{"k", "v2"})));
+
+    auto resp = client.cmd(GetCmd{"k"});
+    ASSERT_TRUE(holds<ValueResp>(resp));
+    EXPECT_EQ(get<ValueResp>(resp).value, "v2");
+}
+
+TEST_F(BinaryIntegrationTest, Del) {
+    BinarySyncClient client;
+    EXPECT_TRUE(holds<OkResp>(client.cmd(SetCmd{"foo", "bar"})));
+
+    auto del_resp = client.cmd(DelCmd{"foo"});
+    EXPECT_TRUE(holds<DeletedResp>(del_resp));
+
+    auto get_resp = client.cmd(GetCmd{"foo"});
+    EXPECT_TRUE(holds<NotFoundResp>(get_resp));
+}
+
+TEST_F(BinaryIntegrationTest, DelNotFound) {
+    BinarySyncClient client;
+    auto resp = client.cmd(DelCmd{"ghost"});
+    EXPECT_TRUE(holds<NotFoundResp>(resp));
+}
+
+TEST_F(BinaryIntegrationTest, KeysEmpty) {
+    BinarySyncClient client;
+    auto resp = client.cmd(KeysCmd{});
+    ASSERT_TRUE(holds<KeysResp>(resp));
+    EXPECT_TRUE(get<KeysResp>(resp).keys.empty());
+}
+
+TEST_F(BinaryIntegrationTest, KeysAfterInserts) {
+    BinarySyncClient client;
+    EXPECT_TRUE(holds<OkResp>(client.cmd(SetCmd{"a", "1"})));
+    EXPECT_TRUE(holds<OkResp>(client.cmd(SetCmd{"b", "2"})));
+
+    auto resp = client.cmd(KeysCmd{});
+    ASSERT_TRUE(holds<KeysResp>(resp));
+    auto keys = get<KeysResp>(resp).keys;
+    std::sort(keys.begin(), keys.end());
+    ASSERT_EQ(keys.size(), 2u);
+    EXPECT_EQ(keys[0], "a");
+    EXPECT_EQ(keys[1], "b");
+}
+
+TEST_F(BinaryIntegrationTest, ValueWithBinaryData) {
+    // Binary protocol should handle arbitrary bytes (including null bytes).
+    BinarySyncClient client;
+    std::string value("hello\x00world", 11); // 11 bytes: "hello" + \0 + "world"
+    EXPECT_TRUE(holds<OkResp>(client.cmd(SetCmd{"binkey", value})));
+
+    auto resp = client.cmd(GetCmd{"binkey"});
+    ASSERT_TRUE(holds<ValueResp>(resp));
+    EXPECT_EQ(get<ValueResp>(resp).value, value);
+}
+
+TEST_F(BinaryIntegrationTest, LargeValue) {
+    // Test with a value larger than typical TCP buffer sizes.
+    BinarySyncClient client;
+    std::string big(100'000, 'X');
+    EXPECT_TRUE(holds<OkResp>(client.cmd(SetCmd{"bigkey", big})));
+
+    auto resp = client.cmd(GetCmd{"bigkey"});
+    ASSERT_TRUE(holds<ValueResp>(resp));
+    EXPECT_EQ(get<ValueResp>(resp).value, big);
+}
+
+TEST_F(BinaryIntegrationTest, MultipleConnections) {
+    BinarySyncClient c1;
+    BinarySyncClient c2;
+
+    EXPECT_TRUE(holds<OkResp>(c1.cmd(SetCmd{"shared", "42"})));
+
+    auto resp = c2.cmd(GetCmd{"shared"});
+    ASSERT_TRUE(holds<ValueResp>(resp));
+    EXPECT_EQ(get<ValueResp>(resp).value, "42");
+}
+
+TEST_F(BinaryIntegrationTest, UnknownMessageType) {
+    BinarySyncClient client;
+    // Send a binary request with unknown msg_type 0x0F and empty payload.
+    std::vector<uint8_t> raw = {0x0F, 0x00, 0x00, 0x00, 0x00};
+    client.send_raw(raw);
+
+    auto resp = client.recv();
+    ASSERT_TRUE(holds<ErrorResp>(resp));
+    EXPECT_NE(get<ErrorResp>(resp).message.find("unknown"), std::string::npos);
+}
+
+TEST_F(BinaryIntegrationTest, PipelineMultipleCommands) {
+    BinarySyncClient client;
+    // Send several commands back-to-back before reading responses.
+    client.send(SetCmd{"p1", "aaa"});
+    client.send(SetCmd{"p2", "bbb"});
+    client.send(GetCmd{"p1"});
+    client.send(GetCmd{"p2"});
+    client.send(PingCmd{});
+
+    EXPECT_TRUE(holds<OkResp>(client.recv()));
+    EXPECT_TRUE(holds<OkResp>(client.recv()));
+
+    auto r3 = client.recv();
+    ASSERT_TRUE(holds<ValueResp>(r3));
+    EXPECT_EQ(get<ValueResp>(r3).value, "aaa");
+
+    auto r4 = client.recv();
+    ASSERT_TRUE(holds<ValueResp>(r4));
+    EXPECT_EQ(get<ValueResp>(r4).value, "bbb");
+
+    EXPECT_TRUE(holds<PongResp>(client.recv()));
+}
+
+TEST_F(BinaryIntegrationTest, AutoDetectionTextAfterBinary) {
+    // One client uses binary, another uses text — same server, same port.
+    BinarySyncClient bin_client;
+    EXPECT_TRUE(holds<OkResp>(bin_client.cmd(SetCmd{"mixed", "frombinary"})));
+
+    // Text client on the same port (BINARY_TEST_PORT).
+    SyncClient text_client(BINARY_TEST_PORT);
+    EXPECT_EQ(text_client.cmd("GET mixed"), "VALUE frombinary");
+}
+
+TEST_F(BinaryIntegrationTest, EmptyKey) {
+    // The session should handle requests that the parser rejects
+    // (empty key produces an ErrorResp from parse_binary_request).
+    BinarySyncClient client;
+    // Craft a GET request with key_len = 0.
+    std::vector<uint8_t> raw;
+    raw.push_back(binary::kMsgGet); // msg_type
+    // payload_length = 2 (key_len field only, key_len=0)
+    raw.push_back(0x00); raw.push_back(0x00);
+    raw.push_back(0x00); raw.push_back(0x02);
+    // key_len = 0
+    raw.push_back(0x00); raw.push_back(0x00);
+    client.send_raw(raw);
+
+    auto resp = client.recv();
+    ASSERT_TRUE(holds<ErrorResp>(resp));
+    EXPECT_NE(get<ErrorResp>(resp).message.find("empty key"), std::string::npos);
 }
 
 } // anonymous namespace
