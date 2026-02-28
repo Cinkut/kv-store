@@ -32,6 +32,9 @@ public:
 // Each Session is co_spawned from Server::accept_loop() and runs until the
 // client disconnects or an error occurs.  All I/O is done via co_await on the
 // strand owned by the parent Server.
+//
+// Protocol auto-detection: the first byte received determines the protocol.
+// Bytes 0x00–0x1F → binary protocol, 0x20–0x7F → text protocol.
 class Session {
 public:
     // Standalone mode (no Raft) – all commands execute locally.
@@ -41,13 +44,27 @@ public:
     Session(boost::asio::ip::tcp::socket socket, Storage& storage,
             ClusterContext& cluster_ctx);
 
-    // Main coroutine.  Reads newline-delimited commands, dispatches to Storage,
-    // sends back serialized responses.  Returns when the connection closes.
+    // Main coroutine.  Auto-detects protocol, then loops reading commands,
+    // dispatching to Storage, and sending responses.  Returns when the
+    // connection closes.
     boost::asio::awaitable<void> run();
 
 private:
     // Execute a parsed Command against storage and return the appropriate Response.
     [[nodiscard]] Response dispatch(const Command& cmd);
+
+    // Process a single parsed request and send the response.
+    // Shared between text and binary loops.
+    [[nodiscard]] Response process_request(std::variant<Command, ErrorResp>& parse_result);
+
+    // Text protocol loop: reads newline-delimited commands.
+    // `seed` contains any bytes already read that must be prepended to the buffer.
+    boost::asio::awaitable<void> run_text(const std::string& remote, std::string seed);
+
+    // Binary protocol loop: reads 5-byte headers + payloads.
+    // `first_header` contains the already-read first 5-byte header.
+    boost::asio::awaitable<void> run_binary(const std::string& remote,
+                                            std::vector<uint8_t> first_header);
 
     boost::asio::ip::tcp::socket socket_;
     Storage& storage_;

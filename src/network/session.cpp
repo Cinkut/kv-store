@@ -1,8 +1,10 @@
 #include "network/session.hpp"
+#include "network/binary_protocol.hpp"
 #include "network/protocol.hpp"
 
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/buffer.hpp>
+#include <boost/asio/read.hpp>
 #include <boost/asio/read_until.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/write.hpp>
@@ -10,7 +12,9 @@
 
 #include <spdlog/spdlog.h>
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 namespace kv::network {
 
@@ -34,7 +38,50 @@ boost::asio::awaitable<void> Session::run() {
 
     spdlog::debug("Session::run() - client connected from {}", remote);
 
-    std::string buf;
+    // Read the first byte to determine protocol.
+    uint8_t first_byte = 0;
+    auto [ec, n] = co_await boost::asio::async_read(
+        socket_, boost::asio::buffer(&first_byte, 1), use_awaitable);
+
+    if (ec || n == 0) {
+        spdlog::debug("Session::run() - client disconnected before first byte: {}", remote);
+        co_return;
+    }
+
+    if (is_binary_protocol(first_byte)) {
+        spdlog::debug("Session {}: detected binary protocol (first byte 0x{:02x})",
+                       remote, first_byte);
+
+        // Read the remaining 4 bytes of the first header.
+        std::vector<uint8_t> first_header(binary::kHeaderSize);
+        first_header[0] = first_byte;
+
+        auto [hec, hn] = co_await boost::asio::async_read(
+            socket_,
+            boost::asio::buffer(first_header.data() + 1, binary::kHeaderSize - 1),
+            use_awaitable);
+
+        if (hec) {
+            spdlog::debug("Session {}: binary header read error: {}", remote, hec.message());
+            co_return;
+        }
+
+        co_await run_binary(remote, std::move(first_header));
+    } else {
+        spdlog::debug("Session {}: detected text protocol (first byte 0x{:02x})",
+                       remote, first_byte);
+
+        // Seed the text buffer with the first byte already consumed.
+        std::string seed(1, static_cast<char>(first_byte));
+        co_await run_text(remote, std::move(seed));
+    }
+
+    spdlog::debug("Session::run() - client disconnected: {}", remote);
+}
+
+boost::asio::awaitable<void> Session::run_text(const std::string& remote,
+                                                std::string seed) {
+    std::string buf = std::move(seed);
     buf.reserve(256);
 
     for (;;) {
@@ -64,12 +111,7 @@ boost::asio::awaitable<void> Session::run() {
         // Parse.
         auto parse_result = parse_command(line);
 
-        Response response;
-        if (std::holds_alternative<ErrorResp>(parse_result)) {
-            response = std::get<ErrorResp>(parse_result);
-        } else {
-            response = dispatch(std::get<Command>(parse_result));
-        }
+        Response response = process_request(parse_result);
 
         // Serialize and send.
         const std::string wire = serialize_response(response);
@@ -83,8 +125,77 @@ boost::asio::awaitable<void> Session::run() {
             break;
         }
     }
+}
 
-    spdlog::debug("Session::run() - client disconnected: {}", remote);
+boost::asio::awaitable<void> Session::run_binary(const std::string& remote,
+                                                  std::vector<uint8_t> first_header) {
+    std::vector<uint8_t> header_buf(binary::kHeaderSize);
+    bool have_first_header = true;
+
+    for (;;) {
+        if (have_first_header) {
+            header_buf = std::move(first_header);
+            have_first_header = false;
+        } else {
+            // Read the 5-byte header.
+            auto [ec, n] = co_await boost::asio::async_read(
+                socket_, boost::asio::buffer(header_buf), use_awaitable);
+
+            if (ec) {
+                if (ec != boost::asio::error::eof &&
+                    ec != boost::asio::error::connection_reset) {
+                    spdlog::warn("Session {}: binary read header error: {}",
+                                 remote, ec.message());
+                }
+                break;
+            }
+        }
+
+        uint8_t msg_type = 0;
+        uint32_t payload_len = 0;
+        read_binary_header(header_buf, msg_type, payload_len);
+
+        // Read the payload.
+        std::vector<uint8_t> payload(payload_len);
+        if (payload_len > 0) {
+            auto [pec, pn] = co_await boost::asio::async_read(
+                socket_, boost::asio::buffer(payload), use_awaitable);
+
+            if (pec) {
+                spdlog::warn("Session {}: binary read payload error: {}",
+                             remote, pec.message());
+                break;
+            }
+        }
+
+        spdlog::debug("Session {}: binary recv msg_type=0x{:02x} payload_len={}",
+                       remote, msg_type, payload_len);
+
+        // Parse the request.
+        auto parse_result = parse_binary_request(msg_type, payload);
+
+        Response response = process_request(parse_result);
+
+        // Serialize and send.
+        auto wire = serialize_binary_response(response);
+        spdlog::debug("Session {}: binary send status=0x{:02x} payload_len={}",
+                       remote, wire[0], wire.size() - binary::kHeaderSize);
+
+        auto [wec, _] = co_await boost::asio::async_write(
+            socket_, boost::asio::buffer(wire), use_awaitable);
+
+        if (wec) {
+            spdlog::warn("Session {}: binary write error: {}", remote, wec.message());
+            break;
+        }
+    }
+}
+
+Response Session::process_request(std::variant<Command, ErrorResp>& parse_result) {
+    if (std::holds_alternative<ErrorResp>(parse_result)) {
+        return std::get<ErrorResp>(parse_result);
+    }
+    return dispatch(std::get<Command>(parse_result));
 }
 
 Response Session::dispatch(const Command& cmd) {
