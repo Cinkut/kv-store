@@ -231,11 +231,11 @@ Goal: Data survives node restarts.
 
 Goal: Performance improvements via binary client protocol.
 
-- [ ] **5.1 Binary client protocol**
+- [x] **5.1 Binary client protocol**
 
   Wire format defined in `docs/raft-spec.md` section 9. All integers big-endian.
 
-  - [ ] **5.1.1 Binary protocol parser/serializer**
+  - [x] **5.1.1 Binary protocol parser/serializer**
     - New files: `src/network/binary_protocol.hpp`, `src/network/binary_protocol.cpp`
     - `parse_binary_request(span<const uint8_t>)` → `variant<Command, ErrorResp>`
     - `serialize_binary_response(const Response&)` → `vector<uint8_t>`
@@ -245,26 +245,26 @@ Goal: Performance improvements via binary client protocol.
     - msg_type: `0x01`=SET, `0x02`=GET, `0x03`=DEL, `0x04`=KEYS, `0x05`=PING
     - status: `0x00`=OK, `0x01`=VALUE, `0x02`=NOT_FOUND, `0x03`=DELETED, `0x04`=KEYS, `0x05`=PONG, `0x10`=ERROR, `0x20`=REDIRECT
 
-  - [ ] **5.1.2 Unit tests for binary protocol**
+  - [x] **5.1.2 Unit tests for binary protocol**
     - New file: `tests/binary_protocol_test.cpp`
     - Test all 5 request types: encode → decode round-trip
     - Test all 8 response statuses: serialize → verify bytes
     - Test malformed inputs: truncated header, unknown msg_type, payload too short, zero-length key
     - ~20-25 tests
 
-  - [ ] **5.1.3 Dual-mode session (auto-detect text vs binary)**
+  - [x] **5.1.3 Dual-mode session (auto-detect text vs binary)**
     - Modify `Session::run()`: peek first byte of connection
     - First byte `0x00–0x1F` → binary mode, `0x20–0x7F` → text mode
     - Split into `run_text()` (existing logic) and `run_binary()` (new)
     - Binary loop: read 5-byte header → read payload → parse → dispatch → serialize → write
     - `dispatch()` unchanged — works on protocol-agnostic `Command`/`Response`
 
-  - [ ] **5.1.4 Integration tests for binary protocol**
+  - [x] **5.1.4 Integration tests for binary protocol**
     - New `BinarySyncClient` test helper in `tests/integration_test.cpp`
     - Test all operations via binary wire: PING, SET+GET, DEL, KEYS, errors
     - Test auto-detection: text and binary clients on the same server simultaneously
 
-  - [ ] **5.1.5 kv-cli `--binary` flag**
+  - [x] **5.1.5 kv-cli `--binary` flag**
     - Add `--binary` option to `src/cli/main.cpp`
     - When set: encode commands as binary requests, decode binary responses
     - Validates full end-to-end binary path
@@ -276,18 +276,71 @@ Goal: Performance improvements via binary client protocol.
 
 - [x] **5.2 io_uring** — Skipped (optional, minimal benefit for this project scope)
 
+### Etap 6 – Integration (Distributed System)
+
+Goal: Wire all components into a working distributed KV store with Raft consensus.
+
+- [x] **6.1 RealTimer + RealTimerFactory**
+  - Production `Timer`/`TimerFactory` using `boost::asio::steady_timer`
+  - 6 tests
+
+- [x] **6.2 RaftTransport + RaftRpcListener**
+  - `RaftTransport` — outbound Raft RPC via `PeerManager`/`PeerClient`, serializes protobuf to length-prefixed frames
+  - `RaftRpcListener` — inbound TCP listener for Raft RPCs, deserializes and dispatches to `RaftNode`
+  - 6 tests
+
+- [x] **6.3 SnapshotIOImpl**
+  - Production `SnapshotIO` using `Snapshot` + `WAL` + `Storage`
+  - Bridges the `SnapshotIO` abstract interface to real disk persistence
+
+- [x] **6.4 PeerInfo client_port**
+  - Added `client_port` to `PeerInfo` for `REDIRECT` responses
+  - Updated CLI parser, validation, and tests
+
+- [x] **6.5 PersistCallback**
+  - `PersistCallback` interface on `RaftNode` for WAL-before-memory ordering
+  - `persist_metadata(term, voted_for)` + `persist_entry(LogEntry)` called before in-memory state updates
+
+- [x] **6.6 CommitAwaiter**
+  - `CommitAwaiter` — commit-waiting mechanism for client coroutines
+  - `wait_for_commit(index, timeout)` suspends until Raft commits the entry
+  - `notify_commit(index)` / `fail_all()` for lifecycle management
+
+- [x] **6.7 RaftClusterContext + async dispatch**
+  - `RaftClusterContext` — production `ClusterContext` bridging `Session` ↔ Raft
+  - `Session::dispatch()` returns `awaitable<Response>` for async Raft interaction
+  - Followers return `REDIRECT`, leader submits writes through Raft
+
+- [x] **6.8 Startup recovery + main.cpp wiring**
+  - `WalPersistCallback` — production `PersistCallback` using WAL
+  - `RaftNode::restore()` / `restore_snapshot()` for WAL/snapshot replay on startup
+  - Full `main.cpp` wiring: io_context, PeerManager, RaftTransport, RaftRpcListener, RaftNode, client accept loop
+
+- [x] **6.9 run_cluster.sh**
+  - Shell script to launch a 3-node local cluster with proper cleanup
+
+- [x] **6.10 Cluster integration tests + transport fix**
+  - 9 end-to-end tests spawning 3 `kv-server` processes via `fork()`/`execl()`
+  - Tests: PingAllNodes, LeaderAcceptsWrite, FollowerRedirectsWrite, FollowerRedirectsDel, ReadAfterWrite, MultipleWritesAndKeys, DeleteThroughLeader, OverwriteThroughLeader, FollowerReadsAreConsistent
+  - Fixed critical transport bug: added per-peer receive loops to `RaftTransport` so vote/AE responses are actually received (previously one-way fire-and-forget)
+
 ---
 
 ## Testing Strategy
 
-| File                        | Scope              | What It Tests                                      |
-|-----------------------------|--------------------|----------------------------------------------------|
-| `storage_test.cpp`          | Unit               | CRUD, concurrent access, edge cases                |
-| `protocol_test.cpp`         | Unit               | Parse/serialize all commands, malformed input       |
-| `binary_protocol_test.cpp`  | Unit               | Binary encode/decode, round-trips, malformed input  |
-| `raft_test.cpp`             | Unit (mock)        | Election, replication, InstallSnapshot, snapshots   |
-| `wal_test.cpp`              | Unit               | Write, replay, CRC corruption                      |
-| `snapshot_test.cpp`         | Unit               | Snapshot save/load, CRC, atomic writes             |
-| `integration_test.cpp`      | Integration        | Text + binary protocol, multi-connection            |
+| File                            | Scope              | What It Tests                                      |
+|---------------------------------|--------------------|----------------------------------------------------|
+| `storage_test.cpp`              | Unit               | CRUD, concurrent access, edge cases                |
+| `protocol_test.cpp`             | Unit               | Parse/serialize all commands, malformed input       |
+| `binary_protocol_test.cpp`      | Unit               | Binary encode/decode, round-trips, malformed input  |
+| `raft_test.cpp`                 | Unit (mock)        | Election, replication, InstallSnapshot, snapshots   |
+| `wal_test.cpp`                  | Unit               | Write, replay, CRC corruption                      |
+| `snapshot_test.cpp`             | Unit               | Snapshot save/load, CRC, atomic writes             |
+| `real_timer_test.cpp`           | Unit               | RealTimer/RealTimerFactory async behavior           |
+| `raft_transport_test.cpp`       | Unit               | RaftTransport send/receive, RaftRpcListener         |
+| `snapshot_io_impl_test.cpp`     | Unit               | SnapshotIOImpl create/install/load                  |
+| `redirect_test.cpp`             | Integration        | Follower redirect, leader writes, cluster context   |
+| `integration_test.cpp`          | Integration        | Text + binary protocol, multi-connection            |
+| `cluster_integration_test.cpp`  | End-to-end         | 3-node cluster: election, replication, redirects    |
 
-Raft tests use a **mock transport layer** (no real TCP) with **deterministic timers** (manually advance time). This makes tests fast and reproducible.
+**370 tests total.** Raft unit tests use a **mock transport layer** (no real TCP) with **deterministic timers** (manually advance time). Cluster integration tests spawn real `kv-server` processes.
