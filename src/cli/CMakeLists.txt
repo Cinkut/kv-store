@@ -2,6 +2,7 @@ add_executable(kv-cli main.cpp)
 target_link_libraries(kv-cli
     PRIVATE
         kv_common
+        kv_network
         Boost::asio
         Boost::system
         Boost::program_options
