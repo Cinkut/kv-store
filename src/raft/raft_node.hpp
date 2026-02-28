@@ -18,6 +18,7 @@
 
 #include "common/logger.hpp"
 #include "raft/clock.hpp"
+#include "raft/cluster_config.hpp"
 #include "raft/raft_log.hpp"
 #include "raft.pb.h"
 
@@ -234,6 +235,7 @@ public:
     [[nodiscard]] uint64_t commit_index() const noexcept { return commit_index_; }
     [[nodiscard]] uint64_t last_applied() const noexcept { return last_applied_; }
     [[nodiscard]] const RaftLog& log() const noexcept { return log_; }
+    [[nodiscard]] const ClusterConfiguration& config() const noexcept { return config_; }
 
     // Snapshot state queries.
     [[nodiscard]] uint64_t snapshot_last_index() const noexcept { return snapshot_last_included_index_; }
@@ -314,7 +316,7 @@ private:
     boost::asio::strand<boost::asio::io_context::executor_type> strand_;
 
     const uint32_t node_id_;
-    const std::vector<uint32_t> peer_ids_;
+    ClusterConfiguration config_;
 
     Transport& transport_;
     TimerFactory& timer_factory_;
