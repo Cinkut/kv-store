@@ -38,6 +38,15 @@ void StateMachine::apply(const LogEntry& entry) {
             }
             break;
 
+        case CMD_CONFIG:
+            // Config changes are handled by RaftNode::apply_config_entry(),
+            // not the state machine.  Nothing to do here for storage.
+            if (logger_) {
+                logger_->debug("[apply] CONFIG at index {} (handled by RaftNode)",
+                               entry.index());
+            }
+            break;
+
         default:
             if (logger_) {
                 logger_->warn("[apply] Unknown command type {} at index {}",
