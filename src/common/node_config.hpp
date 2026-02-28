@@ -32,6 +32,7 @@ struct NodeConfig {
     std::string data_dir;           // Directory for WAL and snapshot files
     uint32_t    snapshot_interval;  // Committed entries between snapshots
     std::string log_level;          // spdlog level string
+    std::string engine;             // Storage engine: "memory" (default) or "rocksdb"
 
     std::vector<PeerInfo> peers;    // All other nodes in the cluster (>= 2 required)
 };

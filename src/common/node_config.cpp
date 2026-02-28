@@ -137,6 +137,11 @@ void validate(const NodeConfig& cfg) {
         throw std::runtime_error("--snapshot-interval must be > 0");
     }
 
+    if (cfg.engine != "memory" && cfg.engine != "rocksdb") {
+        throw std::runtime_error(
+            std::format("--engine must be 'memory' or 'rocksdb', got '{}'", cfg.engine));
+    }
+
     // At least 2 peers required (for a majority quorum of 3 nodes).
     if (cfg.peers.size() < 2) {
         throw std::runtime_error(
@@ -193,7 +198,10 @@ void add_options(po::options_description& desc) {
             "Number of committed entries between snapshots")
         ("log-level",
             po::value<std::string>()->default_value("info"),
-            "Log level: trace|debug|info|warn|error|critical");
+            "Log level: trace|debug|info|warn|error|critical")
+        ("engine",
+            po::value<std::string>()->default_value("memory"),
+            "Storage engine: memory (default) or rocksdb");
 }
 
 // ── parse_config ──────────────────────────────────────────────────────────────
@@ -228,6 +236,7 @@ NodeConfig parse_config(int argc, char* argv[]) {
     cfg.data_dir          = vm["data-dir"].as<std::string>();
     cfg.snapshot_interval = vm["snapshot-interval"].as<uint32_t>();
     cfg.log_level         = vm["log-level"].as<std::string>();
+    cfg.engine            = vm["engine"].as<std::string>();
     cfg.peers             = parse_peers(vm["peers"].as<std::string>());
 
     validate(cfg);

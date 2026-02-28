@@ -14,6 +14,7 @@
 #include "raft/state_machine.hpp"
 #include "storage/storage.hpp"
 #include "storage/storage_engine.hpp"
+#include "storage/rocksdb_storage.hpp"
 
 #include <boost/asio/as_tuple.hpp>
 #include <boost/asio/co_spawn.hpp>
@@ -70,7 +71,20 @@ int main(int argc, char* argv[]) {
     }
 
     // ── Storage ──────────────────────────────────────────────────────────────
-    kv::Storage storage;
+    std::unique_ptr<kv::StorageEngine> storage;
+    if (cfg.engine == "rocksdb") {
+        const auto db_path = data_dir / "rocksdb";
+        try {
+            storage = std::make_unique<kv::RocksDBStorage>(db_path);
+        } catch (const std::runtime_error& e) {
+            logger->error("Failed to open RocksDB engine: {}", e.what());
+            return 1;
+        }
+        logger->info("Using RocksDB storage engine at {}", db_path.string());
+    } else {
+        storage = std::make_unique<kv::MemoryStorage>();
+        logger->info("Using in-memory storage engine");
+    }
 
     // ── WAL ──────────────────────────────────────────────────────────────────
     const fs::path wal_path = data_dir / "wal.bin";
@@ -95,9 +109,9 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        storage.clear();
+        storage->clear();
         for (auto& [k, v] : snap_result.data) {
-            storage.set(std::move(k), std::move(v));
+            storage->set(std::move(k), std::move(v));
         }
 
         snapshot_last_index = snap_result.metadata.last_included_index;
@@ -148,7 +162,7 @@ int main(int argc, char* argv[]) {
     // ── Apply restored entries to storage ─────────────────────────────────────
     // All WAL entries are re-applied on startup. Uncommitted entries will be
     // resolved by Raft conflict resolution after the cluster reforms.
-    kv::raft::StateMachine state_machine{storage, logger};
+    kv::raft::StateMachine state_machine{*storage, logger};
     if (snapshot_last_index > 0) {
         state_machine.reset(snapshot_last_index);
     }
@@ -182,7 +196,7 @@ int main(int argc, char* argv[]) {
     kv::raft::RaftTransport transport{peer_mgr, logger};
     kv::raft::RealTimerFactory timer_factory{ioc};
     kv::persistence::WalPersistCallback persist_cb{wal, logger};
-    kv::persistence::SnapshotIOImpl snapshot_io{data_dir, storage, wal, logger};
+    kv::persistence::SnapshotIOImpl snapshot_io{data_dir, *storage, wal, logger};
     kv::raft::CommitAwaiter commit_awaiter{ioc, logger};
 
     // Apply callback: apply committed entries + notify waiting clients.
@@ -247,7 +261,7 @@ int main(int argc, char* argv[]) {
             socket.set_option(asio::ip::tcp::no_delay(true));
 
             auto sp = std::make_shared<kv::network::Session>(
-                std::move(socket), storage, cluster_ctx);
+                std::move(socket), *storage, cluster_ctx);
 
             asio::co_spawn(
                 ioc,
