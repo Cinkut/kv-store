@@ -10,6 +10,7 @@ add_executable(kvstore_tests
     wal_test.cpp
     snapshot_test.cpp
     binary_protocol_test.cpp
+    real_timer_test.cpp
 )
 target_link_libraries(kvstore_tests
     PRIVATE

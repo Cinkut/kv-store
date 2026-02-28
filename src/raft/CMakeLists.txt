@@ -3,6 +3,7 @@ add_library(kv_raft STATIC
     raft_node.cpp
     raft_log.cpp
     state_machine.cpp
+    real_timer.cpp
 )
 
 # ── Protobuf code generation ──────────────────────────────────────────────────
