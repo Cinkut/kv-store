@@ -4,6 +4,8 @@
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/read.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/write.hpp>
 
@@ -93,6 +95,54 @@ RaftTransport::find_client(uint32_t peer_id) const
         }
     }
     return nullptr;
+}
+
+void RaftTransport::start_receive_loops()
+{
+    for (const auto& client : peer_manager_.clients()) {
+        asio::co_spawn(raft_node_->strand(),
+                       receive_loop(client),
+                       asio::detached);
+    }
+    logger_->info("RaftTransport: started receive loops for {} peers",
+                  peer_manager_.clients().size());
+}
+
+asio::awaitable<void>
+RaftTransport::receive_loop(std::shared_ptr<kv::network::PeerClient> client)
+{
+    uint32_t peer_id = client->peer_id();
+
+    while (true) {
+        // Wait until connected before trying to receive.
+        if (!client->is_connected()) {
+            // Poll periodically — PeerClient reconnects automatically.
+            asio::steady_timer delay{co_await asio::this_coro::executor,
+                                     std::chrono::milliseconds{100}};
+            auto [ec] = co_await delay.async_wait(
+                asio::as_tuple(asio::use_awaitable));
+            if (ec) co_return;  // cancelled
+            continue;
+        }
+
+        auto data = co_await client->receive();
+        if (data.empty()) {
+            // Connection lost or peer closed.  The PeerClient auto-reconnects,
+            // so just loop back and wait for reconnection.
+            logger_->debug("RaftTransport: receive from peer {} returned empty "
+                           "(disconnected?)", peer_id);
+            continue;
+        }
+
+        RaftMessage msg;
+        if (!msg.ParseFromArray(data.data(), static_cast<int>(data.size()))) {
+            logger_->warn("RaftTransport: failed to parse response from peer {}",
+                          peer_id);
+            continue;
+        }
+
+        co_await raft_node_->handle_message(peer_id, msg);
+    }
 }
 
 // ── RaftRpcListener ──────────────────────────────────────────────────────────

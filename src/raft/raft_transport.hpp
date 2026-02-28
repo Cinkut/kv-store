@@ -34,6 +34,17 @@ public:
     RaftTransport(kv::network::PeerManager& peer_manager,
                   std::shared_ptr<spdlog::logger> logger);
 
+    // Wire the RaftNode reference (must be called before start_receive_loops).
+    // Required because of circular dependency: RaftNode needs Transport,
+    // and Transport needs RaftNode to dispatch responses.
+    void set_raft_node(RaftNode* node) noexcept { raft_node_ = node; }
+
+    // Start a receive-loop coroutine for each PeerClient.  Each loop
+    // continuously reads incoming response messages from the peer's outbound
+    // TCP connection and dispatches them to the RaftNode.
+    // Must be called after set_raft_node() and after PeerManager::start().
+    void start_receive_loops();
+
     // Send a RaftMessage to a peer.  Returns true on success.
     boost::asio::awaitable<bool>
     send(uint32_t peer_id, RaftMessage msg) override;
@@ -42,8 +53,13 @@ private:
     // Find the PeerClient for a given peer ID.  Returns nullptr if not found.
     std::shared_ptr<kv::network::PeerClient> find_client(uint32_t peer_id) const;
 
+    // Per-peer receive loop: reads response messages and dispatches to RaftNode.
+    boost::asio::awaitable<void>
+    receive_loop(std::shared_ptr<kv::network::PeerClient> client);
+
     kv::network::PeerManager& peer_manager_;
     std::shared_ptr<spdlog::logger> logger_;
+    RaftNode* raft_node_{nullptr};
 };
 
 // ── RaftRpcListener ──────────────────────────────────────────────────────────

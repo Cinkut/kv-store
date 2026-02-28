@@ -196,6 +196,9 @@ int main(int argc, char* argv[]) {
         ioc, cfg.id, peer_ids, transport, timer_factory, logger,
         apply_callback, &snapshot_io, cfg.snapshot_interval, &persist_cb};
 
+    // Wire the RaftNode into the transport so responses can be dispatched.
+    transport.set_raft_node(&raft_node);
+
     // Restore Raft state from WAL/snapshot (before start).
     if (snapshot_last_index > 0) {
         raft_node.restore_snapshot(snapshot_last_index, snapshot_last_term);
@@ -271,6 +274,7 @@ int main(int argc, char* argv[]) {
     // ── Start all components ─────────────────────────────────────────────────
     peer_mgr.start();
     raft_listener.start();
+    transport.start_receive_loops();
     raft_node.start();
     asio::co_spawn(ioc, client_accept_loop(), asio::detached);
 
