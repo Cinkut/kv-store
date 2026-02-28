@@ -58,7 +58,31 @@ FetchContent_Declare(
 set(ABSL_ENABLE_INSTALL ON CACHE BOOL "" FORCE)
 set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "" FORCE)
 
-FetchContent_MakeAvailable(abseil protobuf Boost spdlog googletest)
+# RocksDB – embedded key-value storage engine
+FetchContent_Declare(
+    rocksdb
+    GIT_REPOSITORY https://github.com/facebook/rocksdb.git
+    GIT_TAG        v9.9.3
+    GIT_SHALLOW    TRUE
+)
+# Minimal build – disable everything we don't need
+set(WITH_TESTS         OFF CACHE BOOL "" FORCE)
+set(WITH_BENCHMARK_TOOLS OFF CACHE BOOL "" FORCE)
+set(WITH_TOOLS         OFF CACHE BOOL "" FORCE)
+set(WITH_CORE_TOOLS    OFF CACHE BOOL "" FORCE)
+set(WITH_ALL_TESTS     OFF CACHE BOOL "" FORCE)
+set(WITH_GFLAGS        OFF CACHE BOOL "" FORCE)
+set(WITH_JEMALLOC      OFF CACHE BOOL "" FORCE)
+set(WITH_SNAPPY        OFF CACHE BOOL "" FORCE)
+set(WITH_LZ4           OFF CACHE BOOL "" FORCE)
+set(WITH_ZLIB          OFF CACHE BOOL "" FORCE)
+set(WITH_ZSTD          OFF CACHE BOOL "" FORCE)
+set(WITH_BZ2           OFF CACHE BOOL "" FORCE)
+set(ROCKSDB_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(FAIL_ON_WARNINGS   OFF CACHE BOOL "" FORCE)
+set(PORTABLE           ON  CACHE BOOL "" FORCE)
+
+FetchContent_MakeAvailable(abseil protobuf Boost spdlog googletest rocksdb)
 
 # ── Protobuf code-generation helper (provided by protobuf but not auto-included)
 include(${protobuf_SOURCE_DIR}/cmake/protobuf-generate.cmake)
