@@ -269,7 +269,7 @@ Goal: Performance improvements via binary client protocol.
     - When set: encode commands as binary requests, decode binary responses
     - Validates full end-to-end binary path
 
-  - [ ] **5.1.6 Throughput benchmark**
+  - [x] **5.1.6 Throughput benchmark**
     - Standalone benchmark: N SET+GET cycles, measure elapsed time
     - Compare text vs binary protocol throughput
     - Print results summary (ops/sec, latency percentiles)
