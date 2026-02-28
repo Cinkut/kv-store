@@ -1,5 +1,6 @@
 add_executable(kvstore_tests
     storage_test.cpp
+    rocksdb_storage_test.cpp
     protocol_test.cpp
     integration_test.cpp
     node_config_test.cpp
