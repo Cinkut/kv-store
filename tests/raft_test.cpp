@@ -3031,3 +3031,891 @@ TEST_F(ReadLeaseTest, LeaseWithDefaultClock) {
     node.stop();
     pump(ioc);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Dynamic Membership (Etap 7.4.11) tests
+// ════════════════════════════════════════════════════════════════════════════
+
+class DynamicMembershipTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        spdlog::drop("kv");
+        spdlog::drop("node-1");
+        kv::init_default_logger(spdlog::level::debug);
+        logger_ = kv::make_node_logger(1, spdlog::level::debug);
+    }
+
+    // Build a vector of NodeInfo for a given set of node IDs (minimal info).
+    static std::vector<NodeInfo> make_node_infos(
+            std::initializer_list<uint32_t> ids) {
+        std::vector<NodeInfo> result;
+        for (uint32_t id : ids) {
+            NodeInfo n;
+            n.set_id(id);
+            n.set_host("localhost");
+            n.set_raft_port(9000 + id);
+            n.set_client_port(8000 + id);
+            result.push_back(std::move(n));
+        }
+        return result;
+    }
+
+    // Create a leader on a 3-node cluster {1, 2, 3}.
+    // Optionally accepts a config change callback and snapshot IO.
+    struct LeaderBundle {
+        std::unique_ptr<MockTransport> transport;
+        std::unique_ptr<DeterministicTimerFactory> timer_factory;
+        std::unique_ptr<RaftNode> node;
+        DeterministicTimer* election_timer() {
+            return timer_factory->timer(timer_factory->timer_count() - 2);
+        }
+        DeterministicTimer* heartbeat_timer() {
+            return timer_factory->timer(timer_factory->timer_count() - 1);
+        }
+    };
+
+    LeaderBundle make_leader(
+            boost::asio::io_context& ioc,
+            RaftNode::ApplyCallback on_apply = {},
+            MockSnapshotIO* snap_io = nullptr,
+            uint64_t snap_interval = 0,
+            PersistCallback* persist_cb = nullptr,
+            RaftNode::ConfigChangeCallback on_config_change = {}) {
+        auto transport = std::make_unique<MockTransport>();
+        auto timer_factory = std::make_unique<DeterministicTimerFactory>();
+
+        auto node = std::make_unique<RaftNode>(
+            ioc, 1, std::vector<uint32_t>{2, 3},
+            *transport, *timer_factory, logger_,
+            std::move(on_apply), snap_io, snap_interval,
+            persist_cb, nullptr,
+            std::move(on_config_change));
+
+        node->start();
+        pump(ioc);
+
+        auto* et = timer_factory->timer(timer_factory->timer_count() - 2);
+        et->fire();
+        pump(ioc);
+
+        // Peer 2 grants vote → majority in {1,2,3}.
+        RequestVoteResponse vresp;
+        vresp.set_term(1);
+        vresp.set_vote_granted(true);
+        node->handle_vote_response(2, vresp);
+        pump(ioc);
+
+        assert(node->state() == kv::NodeState::Leader);
+        transport->clear_sent();
+
+        return {std::move(transport), std::move(timer_factory), std::move(node)};
+    }
+
+    // Simulate an AE ack from a peer with match_index = node's last log index.
+    static void ack_from(RaftNode& node, uint32_t peer) {
+        AppendEntriesResponse resp;
+        resp.set_term(node.current_term());
+        resp.set_success(true);
+        resp.set_match_index(node.log().last_index());
+        node.handle_append_entries_response(peer, resp);
+    }
+
+    std::shared_ptr<spdlog::logger> logger_;
+};
+
+// ── 1. submit_config_change() on leader succeeds ────────────────────────────
+
+TEST_F(DynamicMembershipTest, SubmitConfigChangeOnLeaderSucceeds) {
+    boost::asio::io_context ioc;
+    auto bundle = make_leader(ioc);
+    auto& node = *bundle.node;
+
+    // Submit a config change: add node 4 to cluster {1, 2, 3}.
+    auto new_nodes = make_node_infos({1, 2, 3, 4});
+    ASSERT_TRUE(node.submit_config_change(std::move(new_nodes)));
+
+    pump(ioc);
+
+    // Log should contain: [1]=no-op, [2]=CMD_CONFIG (joint).
+    EXPECT_EQ(node.log().last_index(), 2u);
+    const auto* entry = node.log().entry_at(2);
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->command().type(), CMD_CONFIG);
+    EXPECT_TRUE(entry->has_config());
+    EXPECT_GT(entry->config().old_nodes_size(), 0);  // Joint: has old_nodes.
+    EXPECT_GT(entry->config().new_nodes_size(), 0);
+
+    // Config should be in joint consensus.
+    EXPECT_TRUE(node.config().is_joint());
+
+    node.stop();
+    pump(ioc);
+}
+
+// ── 2. submit_config_change() on non-leader returns false ───────────────────
+
+TEST_F(DynamicMembershipTest, SubmitConfigChangeOnFollowerFails) {
+    boost::asio::io_context ioc;
+    MockTransport transport;
+    DeterministicTimerFactory timer_factory;
+
+    RaftNode node(ioc, 1, std::vector<uint32_t>{2, 3},
+                  transport, timer_factory, logger_);
+    node.start();
+    pump(ioc);
+
+    ASSERT_EQ(node.state(), kv::NodeState::Follower);
+
+    auto new_nodes = make_node_infos({1, 2, 3, 4});
+    EXPECT_FALSE(node.submit_config_change(std::move(new_nodes)));
+
+    node.stop();
+    pump(ioc);
+}
+
+// ── 3. submit_config_change() when another change is pending returns false ──
+
+TEST_F(DynamicMembershipTest, SubmitConfigChangeWhenPendingFails) {
+    boost::asio::io_context ioc;
+    auto bundle = make_leader(ioc);
+    auto& node = *bundle.node;
+
+    // First config change: add node 4.
+    ASSERT_TRUE(node.submit_config_change(make_node_infos({1, 2, 3, 4})));
+    pump(ioc);
+
+    // Second config change while first is pending: should fail.
+    EXPECT_FALSE(node.submit_config_change(make_node_infos({1, 2, 3, 4, 5})));
+
+    node.stop();
+    pump(ioc);
+}
+
+// ── 4. submit_config_change() when already in joint consensus returns false ─
+
+TEST_F(DynamicMembershipTest, SubmitConfigChangeWhileJointFails) {
+    boost::asio::io_context ioc;
+    auto bundle = make_leader(ioc);
+    auto& node = *bundle.node;
+
+    ASSERT_TRUE(node.submit_config_change(make_node_infos({1, 2, 3, 4})));
+    pump(ioc);
+    ASSERT_TRUE(node.config().is_joint());
+
+    // Try another change while in joint: should fail.
+    EXPECT_FALSE(node.submit_config_change(make_node_infos({1, 2})));
+
+    node.stop();
+    pump(ioc);
+}
+
+// ── 5. Joint consensus quorum requires majority in BOTH old and new configs ─
+
+TEST_F(DynamicMembershipTest, JointQuorumRequiresMajorityInBothConfigs) {
+    boost::asio::io_context ioc;
+
+    std::vector<LogEntry> applied;
+    auto on_apply = [&](const LogEntry& entry) {
+        applied.push_back(entry);
+    };
+
+    auto bundle = make_leader(ioc, on_apply);
+    auto& node = *bundle.node;
+
+    // Add node 4: old={1,2,3}, new={1,2,3,4}.
+    // Majority of old: 2/3.  Majority of new: 3/4.
+    ASSERT_TRUE(node.submit_config_change(make_node_infos({1, 2, 3, 4})));
+    pump(ioc);
+    bundle.transport->clear_sent();
+
+    // After submit_config_change: log has [1]=no-op (term 1), [2]=config (term 1).
+    ASSERT_EQ(node.log().last_index(), 2u);
+
+    // Only peer 2 acks → old quorum: {1,2}=2/3 ✓, new quorum: {1,2}=2/4 ✗.
+    // Should NOT advance commit_index.
+    ack_from(node, 2);
+    pump(ioc);
+    EXPECT_EQ(node.commit_index(), 0u);
+
+    // Now peer 3 acks → old: {1,2,3}=3/3 ✓, new: {1,2,3}=3/4 ✓.
+    // Commit index should advance.
+    ack_from(node, 3);
+    pump(ioc);
+    EXPECT_GE(node.commit_index(), 2u);
+
+    node.stop();
+    pump(ioc);
+}
+
+// ── 6. Auto-finalization after joint entry commits ──────────────────────────
+
+TEST_F(DynamicMembershipTest, AutoFinalizationAfterJointCommit) {
+    boost::asio::io_context ioc;
+    auto bundle = make_leader(ioc);
+    auto& node = *bundle.node;
+
+    // Add node 4: enter joint consensus.
+    ASSERT_TRUE(node.submit_config_change(make_node_infos({1, 2, 3, 4})));
+    pump(ioc);
+    ASSERT_TRUE(node.config().is_joint());
+
+    // Log: [1]=no-op, [2]=joint config.
+    ASSERT_EQ(node.log().last_index(), 2u);
+    bundle.transport->clear_sent();
+
+    // Ack from peers 2 and 3 → joint entry commits.
+    // old majority: {1,2,3}=3/3 ✓, new majority: {1,2,3}=3/4 ✓.
+    ack_from(node, 2);
+    pump(ioc);
+    ack_from(node, 3);
+    pump(ioc);
+
+    // After joint commit, leader should auto-append finalize entry (C_new).
+    // Log: [1]=no-op, [2]=joint config, [3]=stable config.
+    EXPECT_GE(node.log().last_index(), 3u);
+
+    const auto* finalize_entry = node.log().entry_at(3);
+    ASSERT_NE(finalize_entry, nullptr);
+    EXPECT_EQ(finalize_entry->command().type(), CMD_CONFIG);
+    EXPECT_TRUE(finalize_entry->has_config());
+    // Finalize entry has no old_nodes (stable config).
+    EXPECT_EQ(finalize_entry->config().old_nodes_size(), 0);
+    EXPECT_GT(finalize_entry->config().new_nodes_size(), 0);
+
+    // Config is applied immediately on leader → no longer joint.
+    EXPECT_FALSE(node.config().is_joint());
+
+    // Config should have 4 nodes.
+    EXPECT_EQ(node.config().cluster_size(), 4);
+
+    node.stop();
+    pump(ioc);
+}
+
+// ── 7. Follower applies config on commit ────────────────────────────────────
+
+TEST_F(DynamicMembershipTest, FollowerAppliesConfigOnCommit) {
+    boost::asio::io_context ioc;
+    MockTransport transport;
+    DeterministicTimerFactory timer_factory;
+
+    RaftNode follower(ioc, 2, std::vector<uint32_t>{1, 3},
+                      transport, timer_factory, logger_);
+    follower.start();
+    pump(ioc);
+    ASSERT_EQ(follower.state(), kv::NodeState::Follower);
+
+    // Build a joint config entry as the leader would.
+    ClusterConfig joint_cfg;
+    for (uint32_t id : {1u, 2u, 3u}) {
+        auto* old_node = joint_cfg.add_old_nodes();
+        old_node->set_id(id);
+    }
+    for (uint32_t id : {1u, 2u, 3u, 4u}) {
+        auto* new_node = joint_cfg.add_new_nodes();
+        new_node->set_id(id);
+    }
+
+    LogEntry config_entry;
+    config_entry.set_term(1);
+    config_entry.set_index(1);
+    config_entry.mutable_command()->set_type(CMD_CONFIG);
+    *config_entry.mutable_config() = joint_cfg;
+
+    // Leader sends AE with this config entry, commit covering it.
+    AppendEntriesRequest req;
+    req.set_term(1);
+    req.set_leader_id(1);
+    req.set_prev_log_index(0);
+    req.set_prev_log_term(0);
+    req.set_leader_commit(1);  // Commit this entry immediately.
+    *req.add_entries() = config_entry;
+
+    boost::asio::co_spawn(ioc, [&]() -> boost::asio::awaitable<void> {
+        auto resp = co_await follower.handle_append_entries(req);
+        EXPECT_TRUE(resp.success());
+    }, boost::asio::detached);
+    pump(ioc);
+
+    // Follower should have applied the config on commit.
+    EXPECT_TRUE(follower.config().is_joint());
+    EXPECT_EQ(follower.config().cluster_size(), 4);
+
+    follower.stop();
+    pump(ioc);
+}
+
+// ── 8. Config change callback invoked ───────────────────────────────────────
+
+TEST_F(DynamicMembershipTest, ConfigChangeCallbackInvoked) {
+    boost::asio::io_context ioc;
+
+    int callback_count = 0;
+    bool was_joint = false;
+    int new_cluster_size = 0;
+
+    auto on_config_change = [&](const ClusterConfiguration& cfg,
+                                const LogEntry& entry) {
+        callback_count++;
+        was_joint = cfg.is_joint();
+        new_cluster_size = cfg.cluster_size();
+    };
+
+    auto bundle = make_leader(ioc, {}, nullptr, 0, nullptr, on_config_change);
+    auto& node = *bundle.node;
+
+    // Submit config change: add node 4.
+    ASSERT_TRUE(node.submit_config_change(make_node_infos({1, 2, 3, 4})));
+    pump(ioc);
+
+    // Callback should have been invoked once (for the joint config entry).
+    EXPECT_EQ(callback_count, 1);
+    EXPECT_TRUE(was_joint);
+    EXPECT_EQ(new_cluster_size, 4);
+
+    node.stop();
+    pump(ioc);
+}
+
+// ── 9. Snapshot includes cluster config ─────────────────────────────────────
+
+TEST_F(DynamicMembershipTest, SnapshotIncludesClusterConfig) {
+    boost::asio::io_context ioc;
+    MockSnapshotIO snap_io;
+
+    std::vector<LogEntry> applied;
+    auto on_apply = [&](const LogEntry& entry) {
+        applied.push_back(entry);
+    };
+
+    // Create leader with snapshot support (interval=1 → snapshot after every entry).
+    auto bundle = make_leader(ioc, on_apply, &snap_io, 1);
+    auto& node = *bundle.node;
+
+    // The no-op is index 1 (from become_leader). We need it committed
+    // so that last_applied advances and triggers a snapshot.
+    // Ack the no-op from both peers.
+    ack_from(node, 2);
+    pump(ioc);
+    ack_from(node, 3);
+    pump(ioc);
+
+    // Snapshot should have been triggered.
+    ASSERT_GE(snap_io.create_count(), 1);
+
+    // The snapshot should include the cluster config.
+    const auto& cfg = snap_io.created_config();
+    ASSERT_TRUE(cfg.has_value());
+    EXPECT_GT(cfg->new_nodes_size(), 0);
+}
+
+TEST_F(DynamicMembershipTest, InstallSnapshotRestoresConfig) {
+    boost::asio::io_context ioc;
+    MockSnapshotIO snap_io;
+    MockTransport transport;
+    DeterministicTimerFactory timer_factory;
+
+    RaftNode follower(ioc, 2, std::vector<uint32_t>{1, 3},
+                      transport, timer_factory, logger_,
+                      {}, &snap_io);
+    follower.start();
+    pump(ioc);
+
+    // Build a snapshot with a 4-node cluster config.
+    ClusterConfig cfg;
+    for (uint32_t id : {1u, 2u, 3u, 4u}) {
+        auto* n = cfg.add_new_nodes();
+        n->set_id(id);
+        n->set_host("localhost");
+        n->set_raft_port(9000 + id);
+        n->set_client_port(8000 + id);
+    }
+
+    InstallSnapshotRequest req;
+    req.set_term(1);
+    req.set_leader_id(1);
+    req.set_last_included_index(10);
+    req.set_last_included_term(1);
+    req.set_data("snapshot_data");
+    *req.mutable_config() = cfg;
+
+    boost::asio::co_spawn(ioc, [&]() -> boost::asio::awaitable<void> {
+        auto resp = co_await follower.handle_install_snapshot(req);
+        EXPECT_EQ(resp.term(), 1u);
+    }, boost::asio::detached);
+    pump(ioc);
+
+    // Follower's config should now reflect the 4-node cluster.
+    EXPECT_EQ(follower.config().cluster_size(), 4);
+    EXPECT_FALSE(follower.config().is_joint());
+
+    // SnapshotIO should have received the config.
+    ASSERT_EQ(snap_io.install_count(), 1);
+    ASSERT_TRUE(snap_io.installed_config().has_value());
+    EXPECT_EQ(snap_io.installed_config()->new_nodes_size(), 4);
+
+    follower.stop();
+    pump(ioc);
+}
+
+// ── 10. restore_snapshot() with ClusterConfig ───────────────────────────────
+
+TEST_F(DynamicMembershipTest, RestoreSnapshotWithClusterConfig) {
+    boost::asio::io_context ioc;
+    MockTransport transport;
+    DeterministicTimerFactory timer_factory;
+
+    RaftNode node(ioc, 1, std::vector<uint32_t>{2, 3},
+                  transport, timer_factory, logger_);
+
+    // Build a 4-node config.
+    ClusterConfig cfg;
+    for (uint32_t id : {1u, 2u, 3u, 4u}) {
+        auto* n = cfg.add_new_nodes();
+        n->set_id(id);
+    }
+
+    node.restore_snapshot(10, 2, cfg);
+
+    EXPECT_EQ(node.snapshot_last_index(), 10u);
+    EXPECT_EQ(node.snapshot_last_term(), 2u);
+    EXPECT_EQ(node.config().cluster_size(), 4);
+    EXPECT_FALSE(node.config().is_joint());
+
+    // Peer IDs should include 2, 3, 4 (not self=1).
+    const auto& peers = node.config().peer_ids();
+    EXPECT_EQ(peers.size(), 3u);
+    EXPECT_NE(std::find(peers.begin(), peers.end(), 2), peers.end());
+    EXPECT_NE(std::find(peers.begin(), peers.end(), 3), peers.end());
+    EXPECT_NE(std::find(peers.begin(), peers.end(), 4), peers.end());
+}
+
+TEST_F(DynamicMembershipTest, RestoreSnapshotWithJointConfig) {
+    boost::asio::io_context ioc;
+    MockTransport transport;
+    DeterministicTimerFactory timer_factory;
+
+    RaftNode node(ioc, 1, std::vector<uint32_t>{2, 3},
+                  transport, timer_factory, logger_);
+
+    // Build a joint config: old={1,2,3}, new={1,2,3,4}.
+    ClusterConfig cfg;
+    for (uint32_t id : {1u, 2u, 3u}) {
+        auto* n = cfg.add_old_nodes();
+        n->set_id(id);
+    }
+    for (uint32_t id : {1u, 2u, 3u, 4u}) {
+        auto* n = cfg.add_new_nodes();
+        n->set_id(id);
+    }
+
+    node.restore_snapshot(10, 2, cfg);
+
+    EXPECT_TRUE(node.config().is_joint());
+    EXPECT_EQ(node.config().cluster_size(), 4);
+    // all_peer_ids includes peers from both old and new configs.
+    auto all_peers = node.config().all_peer_ids();
+    EXPECT_NE(std::find(all_peers.begin(), all_peers.end(), 2), all_peers.end());
+    EXPECT_NE(std::find(all_peers.begin(), all_peers.end(), 3), all_peers.end());
+    EXPECT_NE(std::find(all_peers.begin(), all_peers.end(), 4), all_peers.end());
+}
+
+// ── 11. Config entry persisted via PersistCallback ──────────────────────────
+
+TEST_F(DynamicMembershipTest, ConfigEntryPersistedViaPersistCallback) {
+    boost::asio::io_context ioc;
+    RecordingPersistCallback persist;
+
+    auto bundle = make_leader(ioc, {}, nullptr, 0, &persist);
+    auto& node = *bundle.node;
+    persist.clear();
+
+    // Submit config change.
+    ASSERT_TRUE(node.submit_config_change(make_node_infos({1, 2, 3, 4})));
+    pump(ioc);
+
+    // Persist callback should have received the config entry.
+    ASSERT_GE(persist.entry_calls().size(), 1u);
+    bool found_config_entry = false;
+    for (const auto& entry : persist.entry_calls()) {
+        if (entry.command().type() == CMD_CONFIG) {
+            found_config_entry = true;
+            EXPECT_TRUE(entry.has_config());
+            break;
+        }
+    }
+    EXPECT_TRUE(found_config_entry);
+
+    node.stop();
+    pump(ioc);
+}
+
+// ── 12. Finalize entry also persisted ───────────────────────────────────────
+
+TEST_F(DynamicMembershipTest, FinalizeEntryPersisted) {
+    boost::asio::io_context ioc;
+    RecordingPersistCallback persist;
+
+    auto bundle = make_leader(ioc, {}, nullptr, 0, &persist);
+    auto& node = *bundle.node;
+
+    ASSERT_TRUE(node.submit_config_change(make_node_infos({1, 2, 3, 4})));
+    pump(ioc);
+    persist.clear();
+
+    // Commit the joint entry: acks from peers 2 and 3.
+    ack_from(node, 2);
+    pump(ioc);
+    ack_from(node, 3);
+    pump(ioc);
+
+    // Finalize entry should have been persisted.
+    bool found_finalize = false;
+    for (const auto& entry : persist.entry_calls()) {
+        if (entry.command().type() == CMD_CONFIG && entry.has_config()
+            && entry.config().old_nodes_size() == 0) {
+            found_finalize = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found_finalize);
+
+    node.stop();
+    pump(ioc);
+}
+
+// ── 13. Config change callback invoked for both joint and finalize ───────────
+
+TEST_F(DynamicMembershipTest, ConfigChangeCallbackInvokedForBothPhases) {
+    boost::asio::io_context ioc;
+
+    int callback_count = 0;
+    bool first_was_joint = false;
+    bool second_was_stable = false;
+
+    auto on_config_change = [&](const ClusterConfiguration& cfg,
+                                const LogEntry& /*entry*/) {
+        callback_count++;
+        if (callback_count == 1) first_was_joint = cfg.is_joint();
+        if (callback_count == 2) second_was_stable = !cfg.is_joint();
+    };
+
+    auto bundle = make_leader(ioc, {}, nullptr, 0, nullptr, on_config_change);
+    auto& node = *bundle.node;
+
+    ASSERT_TRUE(node.submit_config_change(make_node_infos({1, 2, 3, 4})));
+    pump(ioc);
+    ASSERT_EQ(callback_count, 1);
+
+    // Commit joint entry → triggers finalize.
+    ack_from(node, 2);
+    pump(ioc);
+    ack_from(node, 3);
+    pump(ioc);
+
+    // Two callbacks: one for joint, one for stable.
+    EXPECT_EQ(callback_count, 2);
+    EXPECT_TRUE(first_was_joint);
+    EXPECT_TRUE(second_was_stable);
+
+    node.stop();
+    pump(ioc);
+}
+
+// ── 14. Leader sends AE to all peers during joint consensus ─────────────────
+
+TEST_F(DynamicMembershipTest, LeaderSendsAEToAllPeersDuringJointConsensus) {
+    boost::asio::io_context ioc;
+    auto bundle = make_leader(ioc);
+    auto& node = *bundle.node;
+
+    // Add node 4: now {1,2,3} old, {1,2,3,4} new.
+    ASSERT_TRUE(node.submit_config_change(make_node_infos({1, 2, 3, 4})));
+    pump(ioc);
+
+    // Clear and trigger heartbeat to see who receives AEs.
+    bundle.transport->clear_sent();
+    bundle.heartbeat_timer()->fire();
+    pump(ioc);
+
+    // Should have sent AE to peers 2, 3, and 4 (all_peer_ids).
+    auto ae_msgs = bundle.transport->find_append_entries();
+    std::set<uint32_t> recipients;
+    for (const auto* msg : ae_msgs) {
+        recipients.insert(msg->peer_id);
+    }
+    EXPECT_TRUE(recipients.count(2));
+    EXPECT_TRUE(recipients.count(3));
+    EXPECT_TRUE(recipients.count(4));
+
+    node.stop();
+    pump(ioc);
+}
+
+// ── 15. Removing a node ─────────────────────────────────────────────────────
+
+TEST_F(DynamicMembershipTest, RemoveNodeConfigChange) {
+    boost::asio::io_context ioc;
+    auto bundle = make_leader(ioc);
+    auto& node = *bundle.node;
+
+    // Remove node 3: old={1,2,3}, new={1,2}.
+    ASSERT_TRUE(node.submit_config_change(make_node_infos({1, 2})));
+    pump(ioc);
+
+    EXPECT_TRUE(node.config().is_joint());
+    // New config has 2 nodes.
+    EXPECT_EQ(node.config().cluster_size(), 2);
+
+    // old_only_peer_ids should include 3 (in old but not new).
+    const auto& old_only = node.config().old_only_peer_ids();
+    EXPECT_EQ(old_only.size(), 1u);
+    EXPECT_EQ(old_only[0], 3u);
+
+    // Commit the joint entry. Old majority: 2/3, new majority: 2/2.
+    // Ack from peer 2 → old: {1,2}=2/3 ✓, new: {1,2}=2/2 ✓.
+    ack_from(node, 2);
+    pump(ioc);
+
+    // Joint entry should be committed and finalize should be appended.
+    EXPECT_GE(node.log().last_index(), 3u);
+    EXPECT_FALSE(node.config().is_joint());
+    EXPECT_EQ(node.config().cluster_size(), 2);
+
+    node.stop();
+    pump(ioc);
+}
+
+// ── 16. RaftClusterContext::submit_config_change() builds correct NodeInfo ──
+
+TEST_F(DynamicMembershipTest, ClusterContextSubmitConfigChangeAddNode) {
+    boost::asio::io_context ioc;
+
+    auto transport = std::make_unique<MockTransport>();
+    auto timer_factory = std::make_unique<DeterministicTimerFactory>();
+    kv::raft::CommitAwaiter awaiter(ioc, logger_);
+
+    auto node = std::make_unique<RaftNode>(
+        ioc, 1, std::vector<uint32_t>{2, 3},
+        *transport, *timer_factory, logger_);
+    node->start();
+    pump(ioc);
+
+    // Elect as leader.
+    timer_factory->timer(0)->fire();
+    pump(ioc);
+    RequestVoteResponse vresp;
+    vresp.set_term(1);
+    vresp.set_vote_granted(true);
+    node->handle_vote_response(2, vresp);
+    pump(ioc);
+    ASSERT_EQ(node->state(), kv::NodeState::Leader);
+    transport->clear_sent();
+
+    std::map<uint32_t, std::string> addrs = {
+        {1, "localhost:8001"}, {2, "localhost:8002"}, {3, "localhost:8003"}
+    };
+    kv::raft::RaftClusterContext ctx(*node, awaiter, addrs, logger_);
+
+    // Add node 4 via ClusterContext.
+    kv::AddServerCmd add_cmd;
+    add_cmd.node_id = 4;
+    add_cmd.host = "node4.example.com";
+    add_cmd.raft_port = 9004;
+    add_cmd.client_port = 8004;
+    bool ok = ctx.submit_config_change({add_cmd}, {});
+    EXPECT_TRUE(ok);
+
+    pump(ioc);
+
+    // The node should be in joint consensus now with node 4 added.
+    EXPECT_TRUE(node->config().is_joint());
+    EXPECT_EQ(node->config().cluster_size(), 4);
+
+    // Verify node 4 is in the new config.
+    bool found_node4 = false;
+    for (const auto& n : node->config().nodes()) {
+        if (n.id() == 4) {
+            found_node4 = true;
+            EXPECT_EQ(n.host(), "node4.example.com");
+            EXPECT_EQ(n.raft_port(), 9004);
+            EXPECT_EQ(n.client_port(), 8004);
+        }
+    }
+    EXPECT_TRUE(found_node4);
+
+    node->stop();
+    pump(ioc);
+}
+
+// ── 17. RaftClusterContext::submit_config_change() remove node ──────────────
+
+TEST_F(DynamicMembershipTest, ClusterContextSubmitConfigChangeRemoveNode) {
+    boost::asio::io_context ioc;
+
+    auto transport = std::make_unique<MockTransport>();
+    auto timer_factory = std::make_unique<DeterministicTimerFactory>();
+    kv::raft::CommitAwaiter awaiter(ioc, logger_);
+
+    auto node = std::make_unique<RaftNode>(
+        ioc, 1, std::vector<uint32_t>{2, 3},
+        *transport, *timer_factory, logger_);
+    node->start();
+    pump(ioc);
+
+    timer_factory->timer(0)->fire();
+    pump(ioc);
+    RequestVoteResponse vresp;
+    vresp.set_term(1);
+    vresp.set_vote_granted(true);
+    node->handle_vote_response(2, vresp);
+    pump(ioc);
+    ASSERT_EQ(node->state(), kv::NodeState::Leader);
+    transport->clear_sent();
+
+    std::map<uint32_t, std::string> addrs = {
+        {1, "localhost:8001"}, {2, "localhost:8002"}, {3, "localhost:8003"}
+    };
+    kv::raft::RaftClusterContext ctx(*node, awaiter, addrs, logger_);
+
+    // Remove node 3 via ClusterContext.
+    bool ok = ctx.submit_config_change({}, {3});
+    EXPECT_TRUE(ok);
+
+    pump(ioc);
+
+    EXPECT_TRUE(node->config().is_joint());
+    // New config should have 2 nodes: {1, 2}.
+    EXPECT_EQ(node->config().cluster_size(), 2);
+
+    // Node 3 should NOT be in the new config.
+    bool found_node3 = false;
+    for (const auto& n : node->config().nodes()) {
+        if (n.id() == 3) found_node3 = true;
+    }
+    EXPECT_FALSE(found_node3);
+
+    node->stop();
+    pump(ioc);
+}
+
+// ── 18. RaftClusterContext::submit_config_change() duplicate node fails ─────
+
+TEST_F(DynamicMembershipTest, ClusterContextRejectsDuplicateNode) {
+    boost::asio::io_context ioc;
+
+    auto transport = std::make_unique<MockTransport>();
+    auto timer_factory = std::make_unique<DeterministicTimerFactory>();
+    kv::raft::CommitAwaiter awaiter(ioc, logger_);
+
+    auto node = std::make_unique<RaftNode>(
+        ioc, 1, std::vector<uint32_t>{2, 3},
+        *transport, *timer_factory, logger_);
+    node->start();
+    pump(ioc);
+
+    timer_factory->timer(0)->fire();
+    pump(ioc);
+    RequestVoteResponse vresp;
+    vresp.set_term(1);
+    vresp.set_vote_granted(true);
+    node->handle_vote_response(2, vresp);
+    pump(ioc);
+    ASSERT_EQ(node->state(), kv::NodeState::Leader);
+
+    std::map<uint32_t, std::string> addrs = {
+        {1, "localhost:8001"}, {2, "localhost:8002"}, {3, "localhost:8003"}
+    };
+    kv::raft::RaftClusterContext ctx(*node, awaiter, addrs, logger_);
+
+    // Try to add node 2 which already exists.
+    kv::AddServerCmd add_cmd;
+    add_cmd.node_id = 2;
+    add_cmd.host = "localhost";
+    add_cmd.raft_port = 9002;
+    add_cmd.client_port = 8002;
+    EXPECT_FALSE(ctx.submit_config_change({add_cmd}, {}));
+
+    node->stop();
+    pump(ioc);
+}
+
+// ── 19. RaftClusterContext::current_nodes() ─────────────────────────────────
+
+TEST_F(DynamicMembershipTest, ClusterContextCurrentNodes) {
+    boost::asio::io_context ioc;
+
+    auto transport = std::make_unique<MockTransport>();
+    auto timer_factory = std::make_unique<DeterministicTimerFactory>();
+    kv::raft::CommitAwaiter awaiter(ioc, logger_);
+
+    auto node = std::make_unique<RaftNode>(
+        ioc, 1, std::vector<uint32_t>{2, 3},
+        *transport, *timer_factory, logger_);
+    node->start();
+    pump(ioc);
+
+    std::map<uint32_t, std::string> addrs = {{1, "localhost:8001"}};
+    kv::raft::RaftClusterContext ctx(*node, awaiter, addrs, logger_);
+
+    auto nodes = ctx.current_nodes();
+    // Initial config from peer_ids: nodes are {1, 2, 3} (from init_from_peer_ids).
+    EXPECT_EQ(nodes.size(), 3u);
+
+    std::set<uint32_t> ids;
+    for (const auto& n : nodes) {
+        ids.insert(n.id);
+    }
+    EXPECT_TRUE(ids.count(1));
+    EXPECT_TRUE(ids.count(2));
+    EXPECT_TRUE(ids.count(3));
+
+    node->stop();
+    pump(ioc);
+}
+
+// ── 20. Full end-to-end: add node, commit, finalize, verify stable config ───
+
+TEST_F(DynamicMembershipTest, FullEndToEndAddNode) {
+    boost::asio::io_context ioc;
+
+    int config_callbacks = 0;
+    auto on_config_change = [&](const ClusterConfiguration&,
+                                const LogEntry&) {
+        config_callbacks++;
+    };
+
+    auto bundle = make_leader(ioc, {}, nullptr, 0, nullptr, on_config_change);
+    auto& node = *bundle.node;
+
+    // Step 1: Submit config change (add node 4).
+    ASSERT_TRUE(node.submit_config_change(make_node_infos({1, 2, 3, 4})));
+    pump(ioc);
+    ASSERT_TRUE(node.config().is_joint());
+    EXPECT_EQ(config_callbacks, 1);  // Joint callback.
+
+    // Step 2: Commit joint entry (acks from 2 and 3).
+    ack_from(node, 2);
+    pump(ioc);
+    ack_from(node, 3);
+    pump(ioc);
+
+    // Step 3: Verify finalize was auto-appended.
+    EXPECT_FALSE(node.config().is_joint());
+    EXPECT_EQ(node.config().cluster_size(), 4);
+    EXPECT_EQ(config_callbacks, 2);  // Joint + finalize callbacks.
+
+    // Step 4: Commit finalize entry (acks from 2, 3, and 4).
+    ack_from(node, 2);
+    pump(ioc);
+    ack_from(node, 3);
+    pump(ioc);
+
+    // After finalize committed, config_change_pending_ is false.
+    // Try another config change — should succeed now.
+    ASSERT_TRUE(node.submit_config_change(make_node_infos({1, 2, 3, 4, 5})));
+    pump(ioc);
+
+    node.stop();
+    pump(ioc);
+}

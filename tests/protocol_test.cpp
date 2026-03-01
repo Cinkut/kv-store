@@ -232,4 +232,116 @@ TEST(RoundTrip, SetProducesOk) {
     EXPECT_EQ(serialize_response(OkResp{}), "OK\n");
 }
 
+// ── parse_command: ADDSERVER ──────────────────────────────────────────────────
+
+TEST(ParseCommand, AddServerValid) {
+    auto cmd = expect_command(parse_command("ADDSERVER 4 localhost 9004 8004"));
+    ASSERT_TRUE(std::holds_alternative<kv::AddServerCmd>(cmd));
+    const auto& a = std::get<kv::AddServerCmd>(cmd);
+    EXPECT_EQ(a.node_id, 4u);
+    EXPECT_EQ(a.host, "localhost");
+    EXPECT_EQ(a.raft_port, 9004);
+    EXPECT_EQ(a.client_port, 8004);
+}
+
+TEST(ParseCommand, AddServerWithHostname) {
+    auto cmd = expect_command(parse_command("ADDSERVER 10 node10.example.com 5000 6000"));
+    ASSERT_TRUE(std::holds_alternative<kv::AddServerCmd>(cmd));
+    const auto& a = std::get<kv::AddServerCmd>(cmd);
+    EXPECT_EQ(a.node_id, 10u);
+    EXPECT_EQ(a.host, "node10.example.com");
+    EXPECT_EQ(a.raft_port, 5000);
+    EXPECT_EQ(a.client_port, 6000);
+}
+
+TEST(ParseCommand, AddServerMissingArgsIsError) {
+    // No arguments.
+    auto err1 = expect_error(parse_command("ADDSERVER"));
+    EXPECT_FALSE(err1.message.empty());
+
+    // Only id.
+    auto err2 = expect_error(parse_command("ADDSERVER 4"));
+    EXPECT_FALSE(err2.message.empty());
+
+    // Only id and host.
+    auto err3 = expect_error(parse_command("ADDSERVER 4 localhost"));
+    EXPECT_FALSE(err3.message.empty());
+
+    // Only id, host, and raft_port.
+    auto err4 = expect_error(parse_command("ADDSERVER 4 localhost 9004"));
+    EXPECT_FALSE(err4.message.empty());
+}
+
+TEST(ParseCommand, AddServerExtraArgsIsError) {
+    auto err = expect_error(parse_command("ADDSERVER 4 localhost 9004 8004 extra"));
+    EXPECT_FALSE(err.message.empty());
+}
+
+TEST(ParseCommand, AddServerInvalidIdZeroIsError) {
+    auto err = expect_error(parse_command("ADDSERVER 0 localhost 9004 8004"));
+    EXPECT_FALSE(err.message.empty());
+}
+
+TEST(ParseCommand, AddServerInvalidIdNonNumericIsError) {
+    auto err = expect_error(parse_command("ADDSERVER abc localhost 9004 8004"));
+    EXPECT_FALSE(err.message.empty());
+}
+
+TEST(ParseCommand, AddServerInvalidRaftPortIsError) {
+    auto err = expect_error(parse_command("ADDSERVER 4 localhost notaport 8004"));
+    EXPECT_FALSE(err.message.empty());
+}
+
+TEST(ParseCommand, AddServerInvalidClientPortIsError) {
+    auto err = expect_error(parse_command("ADDSERVER 4 localhost 9004 notaport"));
+    EXPECT_FALSE(err.message.empty());
+}
+
+TEST(ParseCommand, AddServerZeroPortIsError) {
+    auto err = expect_error(parse_command("ADDSERVER 4 localhost 0 8004"));
+    EXPECT_FALSE(err.message.empty());
+}
+
+TEST(ParseCommand, AddServerCRLF) {
+    auto cmd = expect_command(parse_command("ADDSERVER 4 localhost 9004 8004\r"));
+    ASSERT_TRUE(std::holds_alternative<kv::AddServerCmd>(cmd));
+    const auto& a = std::get<kv::AddServerCmd>(cmd);
+    EXPECT_EQ(a.node_id, 4u);
+    EXPECT_EQ(a.client_port, 8004);
+}
+
+// ── parse_command: REMOVESERVER ──────────────────────────────────────────────
+
+TEST(ParseCommand, RemoveServerValid) {
+    auto cmd = expect_command(parse_command("REMOVESERVER 3"));
+    ASSERT_TRUE(std::holds_alternative<kv::RemoveServerCmd>(cmd));
+    EXPECT_EQ(std::get<kv::RemoveServerCmd>(cmd).node_id, 3u);
+}
+
+TEST(ParseCommand, RemoveServerMissingIdIsError) {
+    auto err = expect_error(parse_command("REMOVESERVER"));
+    EXPECT_FALSE(err.message.empty());
+}
+
+TEST(ParseCommand, RemoveServerExtraArgsIsError) {
+    auto err = expect_error(parse_command("REMOVESERVER 3 extra"));
+    EXPECT_FALSE(err.message.empty());
+}
+
+TEST(ParseCommand, RemoveServerInvalidIdZeroIsError) {
+    auto err = expect_error(parse_command("REMOVESERVER 0"));
+    EXPECT_FALSE(err.message.empty());
+}
+
+TEST(ParseCommand, RemoveServerInvalidIdNonNumericIsError) {
+    auto err = expect_error(parse_command("REMOVESERVER abc"));
+    EXPECT_FALSE(err.message.empty());
+}
+
+TEST(ParseCommand, RemoveServerCRLF) {
+    auto cmd = expect_command(parse_command("REMOVESERVER 5\r"));
+    ASSERT_TRUE(std::holds_alternative<kv::RemoveServerCmd>(cmd));
+    EXPECT_EQ(std::get<kv::RemoveServerCmd>(cmd).node_id, 5u);
+}
+
 } // namespace kv::network
